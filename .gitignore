@@ -6,6 +6,7 @@
 /job-list.html
 /job-list.json
 /jobs.sqlite3
+/.env
 
 # Browser/test artifacts
 /test-results/

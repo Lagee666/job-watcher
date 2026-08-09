@@ -52,7 +52,7 @@ Compare with SQLite
 New / Updated
       │
       ▼
-   Log output
+   Log output + LINE notifier
 ```
 
 ## Domain

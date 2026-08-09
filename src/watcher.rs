@@ -30,6 +30,100 @@ struct JobListing {
     published_at: Option<String>,
 }
 
+struct LineNotifier {
+    channel_access_token: String,
+    user_id: String,
+    client: reqwest::blocking::Client,
+}
+
+#[derive(Serialize)]
+struct LinePushRequest {
+    to: String,
+    messages: Vec<LineMessage>,
+}
+
+#[derive(Serialize)]
+struct LineMessage {
+    #[serde(rename = "type")]
+    message_type: &'static str,
+    text: String,
+}
+
+impl LineNotifier {
+    fn from_env() -> Result<Option<Self>> {
+        dotenvy::dotenv().ok();
+        let token = std::env::var("LINE_CHANNEL_ACCESS_TOKEN").ok();
+        let user_id = std::env::var("LINE_USER_ID").ok();
+
+        match (token, user_id) {
+            (None, None) => Ok(None),
+            (Some(_), None) | (None, Some(_)) => {
+                anyhow::bail!("LINE_CHANNEL_ACCESS_TOKEN and LINE_USER_ID must be set together")
+            }
+            (Some(channel_access_token), Some(user_id)) => Ok(Some(Self {
+                channel_access_token,
+                user_id,
+                client: reqwest::blocking::Client::new(),
+            })),
+        }
+    }
+
+    fn notify(&self, changes: &[String]) -> Result<()> {
+        self.notify_entries("104 Rust job changes", changes)
+    }
+
+    fn notify_current(&self, jobs: &[JobListing]) -> Result<()> {
+        let entries = jobs
+            .iter()
+            .map(|job| {
+                format!(
+                    "[CURRENT] {}\n{}\n{}\n{}",
+                    job.title, job.company, job.url, job.external_id
+                )
+            })
+            .collect::<Vec<_>>();
+        self.notify_entries("Current 104 Rust jobs", &entries)
+    }
+
+    fn notify_entries(&self, heading: &str, entries: &[String]) -> Result<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+
+        let mut text = format!("{heading}\n\n");
+        for entry in entries {
+            if text.chars().count() + entry.chars().count() + 2 > 4500 {
+                self.send_text(&text)?;
+                text = format!("{heading} (continued)\n\n");
+            }
+            text.push_str(entry);
+            text.push_str("\n\n");
+        }
+        if text.trim() != heading {
+            self.send_text(&text)?;
+        }
+        Ok(())
+    }
+
+    fn send_text(&self, text: &str) -> Result<()> {
+        self.client
+            .post("https://api.line.me/v2/bot/message/push")
+            .bearer_auth(&self.channel_access_token)
+            .json(&LinePushRequest {
+                to: self.user_id.clone(),
+                messages: vec![LineMessage {
+                    message_type: "text",
+                    text: text.to_owned(),
+                }],
+            })
+            .send()
+            .context("failed to send LINE notification")?
+            .error_for_status()
+            .context("LINE Messaging API rejected the notification")?;
+        Ok(())
+    }
+}
+
 fn parse_job_list(value: &str) -> Result<Vec<JobListing>> {
     serde_json::from_str(value).context("failed to parse extracted 104 job list")
 }
@@ -208,7 +302,7 @@ fn next_scheduled_run() -> Result<Duration> {
         .context("invalid scheduled run duration")
 }
 
-fn run_check() -> Result<()> {
+fn run_check(notifier: Option<&LineNotifier>, notify_current: bool) -> Result<()> {
     let version: ChromeVersion = reqwest::blocking::get("http://127.0.0.1:9222/json/version")?
         .error_for_status()?
         .json()?;
@@ -235,6 +329,8 @@ fn run_check() -> Result<()> {
     let incremental_search = !known_jobs.is_empty();
     let mut seen_job_ids = HashSet::new();
     let mut jobs = Vec::new();
+    let mut current_jobs = Vec::new();
+    let mut changes = Vec::new();
     let mut stopped_on_known_job = false;
 
     for page in 1..=total_pages {
@@ -247,10 +343,17 @@ fn run_check() -> Result<()> {
         }
         let page_jobs = extract_job_list(&tab)
             .with_context(|| format!("failed to extract rendered 104 page {page}"))?;
+        if notify_current && page == 1 {
+            current_jobs = page_jobs.clone();
+        }
         for job in page_jobs {
             if let Some(previous_job) = known_jobs.get(&job.external_id) {
                 if previous_job != &job {
                     println!("[UPDATE] {} {}", job.external_id, job.title);
+                    changes.push(format!(
+                        "[UPDATE] {}\n{}\n{}\n{}",
+                        job.title, job.company, job.url, job.external_id
+                    ));
                     jobs.push(job.clone());
                 }
                 if incremental_search {
@@ -261,6 +364,10 @@ fn run_check() -> Result<()> {
             }
             if seen_job_ids.insert(job.external_id.clone()) {
                 println!("[CREATE] {} {}", job.external_id, job.title);
+                changes.push(format!(
+                    "[CREATE] {}\n{}\n{}\n{}",
+                    job.title, job.company, job.url, job.external_id
+                ));
                 jobs.push(job);
             }
         }
@@ -278,17 +385,40 @@ fn run_check() -> Result<()> {
     );
     let persisted = persist_jobs(&mut connection, &jobs)?;
     println!("Persisted {persisted} jobs to jobs.sqlite3");
+    if let Some(notifier) = notifier {
+        let notification = if notify_current {
+            notifier.notify_current(&current_jobs)
+        } else {
+            notifier.notify(&changes)
+        };
+        match notification {
+            Ok(()) if notify_current && !current_jobs.is_empty() => {
+                println!("Sent current results to LINE");
+            }
+            Ok(()) if !notify_current && !changes.is_empty() => {
+                println!("Sent {} job updates to LINE", changes.len());
+            }
+            Ok(()) => {}
+            Err(error) => eprintln!("LINE notification failed: {error:#}"),
+        }
+    }
     Ok(())
 }
 
 pub fn run_service() -> Result<()> {
+    let notifier = LineNotifier::from_env()?;
+    if notifier.is_some() {
+        println!("LINE notifications enabled");
+    } else {
+        println!("LINE notifications disabled: credentials are not configured");
+    }
     println!("Running initial 104 job check");
-    run_check().context("initial 104 job check failed")?;
+    run_check(notifier.as_ref(), true).context("initial 104 job check failed")?;
     loop {
         let delay = next_scheduled_run()?;
         println!("Next 104 job check in {} seconds", delay.as_secs());
         thread::sleep(delay);
-        if let Err(error) = run_check() {
+        if let Err(error) = run_check(notifier.as_ref(), false) {
             eprintln!("Scheduled 104 job check failed: {error:#}");
         }
     }

@@ -9,12 +9,13 @@ prints newly created or changed jobs.
 
 The executable contains two parts:
 
-1. An Axum HTTP server listening on port `3004`.
+1. An Axum HTTP server listening on port `3004` by default.
 2. A background watcher that performs the 104 synchronization.
 
-The HTTP server currently provides a simple health response at `/`. The watcher
-uses blocking browser, HTTP, and SQLite libraries, so it runs in a Tokio
-blocking task and does not block Axum's async runtime.
+The HTTP server provides a simple health response at `/` and accepts LINE
+webhook events at `POST /webhook`. The watcher uses blocking browser, HTTP, and
+SQLite libraries, so it runs in a Tokio blocking task and does not block Axum's
+async runtime.
 
 ## Check schedule
 
@@ -112,9 +113,25 @@ cargo run
 For an optimized build, use `cargo run --release`.
 
 Open `http://127.0.0.1:3004/` or run `curl http://127.0.0.1:3004/` to verify
-that the Axum server is running. The process checks immediately, then remains
+that the Axum server is running. Set `JOB_WATCHER_PORT` in `.env` to use a
+different port. The process checks immediately, then remains
 running for the 07:00 and 17:00 checks. Stop it with `Ctrl-C`. Full
 installation notes are in [install.md](install.md).
+
+### LINE notifications
+
+To send create/update events to a LINE user, copy the environment template and
+fill in the credentials for your LINE Official Account:
+
+```bash
+cp .env.example .env
+```
+
+Set `LINE_CHANNEL_ACCESS_TOKEN` and `LINE_USER_ID` in `.env`. At startup, LINE
+receives a `[CURRENT]` summary of the current first-page results. Scheduled
+checks send only create/update events after changed jobs are successfully
+written to SQLite. If the variables are absent, the watcher logs events locally
+and continues without LINE.
 
 ## Files produced
 
@@ -175,7 +192,7 @@ Implemented:
 
 Not yet implemented:
 
-- notifications other than log output;
+- notification channels other than LINE and log output;
 - a separate domain/repository abstraction;
 - deletion history or deletion notifications;
 - support for additional job platforms.

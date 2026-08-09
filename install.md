@@ -53,14 +53,38 @@ cargo run
 ```
 
 Use `cargo run --release` for an optimized build. The process starts an Axum
-health server on `http://127.0.0.1:3004/` and runs the watcher immediately,
+health server on `http://127.0.0.1:3004/` by default and runs the watcher immediately,
 then every day at 07:00 and 17:00 in the machine's local timezone:
 
 ```bash
 curl http://127.0.0.1:3004/
 ```
 
+Configure the LINE webhook URL as `https://your-public-host/webhook` in the
+LINE Developers console. The endpoint accepts `POST /webhook` JSON events and
+returns HTTP 200.
+
 Stop the service with `Ctrl-C`.
+
+## Configure LINE notifications
+
+LINE notifications are optional. To enable them:
+
+```bash
+cp .env.example .env
+```
+
+Edit `.env` and set:
+
+```dotenv
+LINE_CHANNEL_ACCESS_TOKEN=your-channel-access-token
+LINE_USER_ID=your-recipient-user-id
+```
+
+Both values must be present together. The channel access token comes from the
+LINE Messaging API channel, and the user ID identifies the recipient. Keep
+`.env` private; it is ignored by Git. Without these values, the service still
+prints `[CREATE]` and `[UPDATE]` events locally.
 
 ## What to expect
 
@@ -76,6 +100,10 @@ The service writes these files in its current directory:
 - `jobs.sqlite3` — persistent job database;
 - `job-list.json` — latest extracted records;
 - `job-list.html` — rendered first-page capture.
+
+When LINE is configured, startup sends a `[CURRENT]` summary of the first-page
+results. Scheduled checks send create/update events through the LINE Messaging
+API after SQLite persistence succeeds.
 
 If Chromium is not listening on port `9222`, the watcher reports a connection
 error. The project uses normal public-page rendering and does not bypass
