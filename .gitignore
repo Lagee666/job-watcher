@@ -1,0 +1,11 @@
+# Generated Rust build output
+/target/
+
+# Local dependency resolution and service output
+/Cargo.lock
+/job-list.html
+/job-list.json
+/jobs.sqlite3
+
+# Browser/test artifacts
+/test-results/

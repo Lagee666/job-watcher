@@ -1,0 +1,18 @@
+[package]
+name = "job-watcher"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]
+resolver = "3"
+
+[dependencies]
+anyhow = "1"
+axum = "0.8"
+chrono = { version = "0.4", features = ["clock"] }
+headless_chrome = "1"
+serde = "1"
+serde_json = "1"
+reqwest = { version = "0.13.0", features = ["blocking", "json"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread"] }
