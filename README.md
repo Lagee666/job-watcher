@@ -22,12 +22,12 @@ async runtime.
 The watcher:
 
 - runs once immediately when the service starts;
-- runs every day at `07:00` and `17:00`;
+- runs every day at `07:00`, `17:00`, and `21:30`;
 - interprets those times in the machine's local timezone;
 - stays running between checks.
 
 ```text
-Start → HTTP server + initial check → sleep → 07:00 check → sleep → 17:00 check
+Start → HTTP server + initial check → scheduled checks at 07:00, 17:00, 21:30
 ```
 
 ## Change detection
@@ -38,19 +38,18 @@ The configured search is:
 https://www.104.com.tw/jobs/search/?jobsource=index_s&keyword=Rust&mode=s&order=16
 ```
 
-Results are expected to be newest-first. The first run scans every result page.
-Later runs stop at the first job ID already in SQLite, which avoids scanning
-older listings.
+Every check scans every result page so the complete current result set can be
+compared with SQLite, including deleted jobs.
 
 For every listing encountered:
 
-- `[CREATE]` means its job ID is not in the database;
-- `[UPDATE]` means an existing listing's tracked fields changed;
-- unchanged listings are silent;
-- jobs missing from the current search are not reported as deleted.
+- `[New]` means its job ID is not in the database;
+- `[Update]` means an existing listing's tracked fields changed;
+- `[Delete]` means a previously saved job is absent from the current result;
+- unchanged listings are silent.
 
 Changed and new listings are upserted into SQLite. A job recreated by 104 with a
-new external ID is therefore reported as `[CREATE]`.
+new external ID is therefore reported as `[New]`.
 
 ## Quick start
 
@@ -115,7 +114,7 @@ For an optimized build, use `cargo run --release`.
 Open `http://127.0.0.1:3004/` or run `curl http://127.0.0.1:3004/` to verify
 that the Axum server is running. Set `JOB_WATCHER_PORT` in `.env` to use a
 different port. The process checks immediately, then remains
-running for the 07:00 and 17:00 checks. Stop it with `Ctrl-C`. Full
+running for the 07:00, 17:00, and 21:30 checks. Stop it with `Ctrl-C`. Full
 installation notes are in [install.md](install.md).
 
 ### LINE notifications
@@ -127,11 +126,14 @@ fill in the credentials for your LINE Official Account:
 cp .env.example .env
 ```
 
-Set `LINE_CHANNEL_ACCESS_TOKEN` and `LINE_USER_ID` in `.env`. At startup, LINE
-receives a `[CURRENT]` summary of the current first-page results. Scheduled
-checks send only create/update events after changed jobs are successfully
-written to SQLite. If the variables are absent, the watcher logs events locally
-and continues without LINE.
+Set `LINE_CHANNEL_ACCESS_TOKEN` and `LINE_USER_ID` in `.env`. At startup and at
+each scheduled check, LINE receives the changed job list after SQLite is
+updated. If nothing changed, no LINE message is sent. If the variables are
+absent, the watcher logs events locally and continues without LINE.
+LINE messages contain at most 5 jobs each and at most 4 messages per check. If
+more jobs remain, the fourth message says the jobs are numerous and links to the
+104 search page. Each job message includes the listing's last updated date from
+104.
 
 ## Files produced
 
@@ -142,13 +144,18 @@ The service writes these files in its current working directory:
 - `job-list.html` — rendered HTML captured from the first search page.
 
 The SQLite table uses `(source, external_id)` as its primary key. Existing jobs
-are updated with the latest extracted values and `last_seen_at`.
+are updated with the latest extracted values and `last_seen_at`. Each saved job
+includes `last_updated`, `work_site`, and `annual_salary` (mapped from the 104
+date, location, and salary fields). Existing databases are migrated when the
+service starts.
 
 ## Repository map
 
 ```text
 src/main.rs       Axum server and Tokio task orchestration
 src/watcher.rs    104 browser extraction, scheduling, comparison, SQLite I/O
+deploy/job-watcher.env.example
+                  Raspberry Pi configuration template for /etc/job-watcher
 docs/architecture.md
                   Design and runtime data flow
 docs/104-source.md
@@ -167,6 +174,19 @@ Cloudflare challenges, or other access controls. See
 strategy.
 
 ## Development checks
+
+The Makefile provides common commands:
+
+```bash
+make build          # optimized build for the current machine
+make build-rpi      # aarch64 Raspberry Pi binary
+make test
+make lint
+```
+
+`make build-rpi` runs `cargo build --release --target
+aarch64-unknown-linux-gnu`. It requires the Rust target and an AArch64 linker
+when building from another architecture.
 
 Run these before submitting changes:
 
@@ -187,7 +207,7 @@ Implemented:
 - virtualized-list scrolling and multi-page collection;
 - SQLite persistence and full-record comparison;
 - create/update logging;
-- startup and twice-daily scheduling;
+- startup and three-times-daily scheduling;
 - Axum health endpoint.
 
 Not yet implemented:

@@ -7,12 +7,12 @@ use axum::{
     routing::{get, post},
 };
 use serde_json::Value;
-use std::net::SocketAddr;
+use std::{net::SocketAddr, path::Path};
 use tokio::task::spawn_blocking;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    dotenvy::dotenv().ok();
+    load_environment()?;
     let app = Router::new()
         .route("/", get(|| async { "Rust Job Watcher is running" }))
         .route("/webhook", post(webhook));
@@ -28,11 +28,21 @@ async fn main() -> Result<()> {
     println!("Job Watcher HTTP server listening on {address}");
 
     let watcher = spawn_blocking(watcher::run_service);
-    println!("Job Watcher HTTP server listening on {address}");
 
     tokio::select! {
         result = axum::serve(listener, app) => result?,
         result = watcher => result??,
+    }
+    Ok(())
+}
+
+fn load_environment() -> Result<()> {
+    let system_config = Path::new("/etc/job-watcher/job-watcher.env");
+    if system_config.is_file() {
+        dotenvy::from_path(system_config)
+            .context("failed to load /etc/job-watcher/job-watcher.env")?;
+    } else {
+        dotenvy::dotenv().ok();
     }
     Ok(())
 }

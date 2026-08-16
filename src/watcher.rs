@@ -72,35 +72,44 @@ impl LineNotifier {
         self.notify_entries("104 Rust job changes", changes)
     }
 
-    fn notify_current(&self, jobs: &[JobListing]) -> Result<()> {
-        let entries = jobs
-            .iter()
-            .map(|job| {
-                format!(
-                    "[CURRENT] {}\n{}\n{}\n{}",
-                    job.title, job.company, job.url, job.external_id
-                )
-            })
-            .collect::<Vec<_>>();
-        self.notify_entries("Current 104 Rust jobs", &entries)
-    }
-
     fn notify_entries(&self, heading: &str, entries: &[String]) -> Result<()> {
         if entries.is_empty() {
             return Ok(());
         }
 
-        let mut text = format!("{heading}\n\n");
+        let mut batch = Vec::new();
+        let mut batch_size = heading.chars().count() + 2;
+        let mut message_number = 1;
         for entry in entries {
-            if text.chars().count() + entry.chars().count() + 2 > 4500 {
-                self.send_text(&text)?;
-                text = format!("{heading} (continued)\n\n");
+            let entry_size = entry.chars().count() + 2;
+            if !batch.is_empty() && (batch.len() >= 5 || batch_size + entry_size > 4500) {
+                let title = if message_number == 1 {
+                    heading.to_owned()
+                } else {
+                    format!("{heading} (continued)")
+                };
+                if message_number == 4 {
+                    self.send_text(&format!(
+                        "{title}\n\n{}\n\nJobs are very much, see: {SEARCH_URL}",
+                        batch.join("\n\n")
+                    ))?;
+                    return Ok(());
+                }
+                self.send_text(&format!("{title}\n\n{}", batch.join("\n\n")))?;
+                batch.clear();
+                batch_size = heading.chars().count() + 2;
+                message_number += 1;
             }
-            text.push_str(entry);
-            text.push_str("\n\n");
+            batch.push(entry.clone());
+            batch_size += entry_size;
         }
-        if text.trim() != heading {
-            self.send_text(&text)?;
+        if !batch.is_empty() {
+            let title = if message_number == 1 {
+                heading.to_owned()
+            } else {
+                format!("{heading} (continued)")
+            };
+            self.send_text(&format!("{title}\n\n{}", batch.join("\n\n")))?;
         }
         Ok(())
     }
@@ -126,6 +135,15 @@ impl LineNotifier {
 
 fn parse_job_list(value: &str) -> Result<Vec<JobListing>> {
     serde_json::from_str(value).context("failed to parse extracted 104 job list")
+}
+
+fn is_challenge_page(title: &str, html: &str) -> bool {
+    let has_job_cards = html.contains("data-job-no");
+    title.trim().eq_ignore_ascii_case("Just a moment...")
+        || (!has_job_cards
+            && (html.contains("challenge-platform")
+                || html.contains("cf-chl-")
+                || html.contains("Verify you are human")))
 }
 
 fn extract_job_list(tab: &Tab) -> Result<Vec<JobListing>> {
@@ -205,19 +223,37 @@ fn ensure_schema(connection: &Connection) -> Result<()> {
             source TEXT NOT NULL, external_id TEXT NOT NULL, title TEXT NOT NULL,
             company TEXT NOT NULL, location TEXT, salary TEXT, description TEXT,
             url TEXT NOT NULL, published_at TEXT,
+            work_site TEXT, annual_salary TEXT, last_updated TEXT,
             first_seen_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
             last_seen_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
             PRIMARY KEY (source, external_id)
         );",
         )
         .context("failed to initialize SQLite schema")?;
+    for (column, definition) in [
+        ("work_site", "TEXT"),
+        ("annual_salary", "TEXT"),
+        ("last_updated", "TEXT"),
+    ] {
+        let exists: bool = connection
+            .prepare("SELECT 1 FROM pragma_table_info('jobs') WHERE name = ?1")?
+            .exists([column])?;
+        if !exists {
+            connection.execute(
+                &format!("ALTER TABLE jobs ADD COLUMN {column} {definition}"),
+                [],
+            )?;
+        }
+    }
     Ok(())
 }
 
 fn load_known_jobs(connection: &Connection) -> Result<HashMap<String, JobListing>> {
     let mut statement = connection
         .prepare(
-            "SELECT external_id, title, company, location, salary, description, url, published_at
+            "SELECT external_id, title, company, COALESCE(work_site, location),
+                    COALESCE(annual_salary, salary), description, url,
+                    COALESCE(last_updated, published_at)
          FROM jobs WHERE source = '104'",
         )
         .context("failed to prepare known 104 jobs query")?;
@@ -248,12 +284,15 @@ fn persist_jobs(connection: &mut Connection, jobs: &[JobListing]) -> Result<usiz
     let mut statement = transaction
         .prepare(
             "INSERT INTO jobs (source, external_id, title, company, location, salary,
-                           description, url, published_at)
-         VALUES ('104', ?, ?, ?, ?, ?, ?, ?, ?)
+                           description, url, published_at, work_site, annual_salary,
+                           last_updated)
+         VALUES ('104', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT (source, external_id) DO UPDATE SET
            title = excluded.title, company = excluded.company, location = excluded.location,
            salary = excluded.salary, description = excluded.description, url = excluded.url,
-           published_at = excluded.published_at, last_seen_at = CURRENT_TIMESTAMP",
+           published_at = excluded.published_at, work_site = excluded.work_site,
+           annual_salary = excluded.annual_salary, last_updated = excluded.last_updated,
+           last_seen_at = CURRENT_TIMESTAMP",
         )
         .context("failed to prepare SQLite job upsert")?;
     for job in jobs {
@@ -266,6 +305,9 @@ fn persist_jobs(connection: &mut Connection, jobs: &[JobListing]) -> Result<usiz
                 job.salary,
                 job.description,
                 job.url,
+                job.published_at,
+                job.location,
+                job.salary,
                 job.published_at
             ])
             .with_context(|| format!("failed to persist 104 job {}", job.external_id))?;
@@ -277,12 +319,26 @@ fn persist_jobs(connection: &mut Connection, jobs: &[JobListing]) -> Result<usiz
     Ok(jobs.len())
 }
 
+fn remove_missing_jobs(connection: &Connection, current_ids: &HashSet<String>) -> Result<usize> {
+    ensure_schema(connection)?;
+    let deleted = if current_ids.is_empty() {
+        connection.execute("DELETE FROM jobs WHERE source = '104'", [])?
+    } else {
+        let placeholders = vec!["?"; current_ids.len()].join(", ");
+        let query = format!(
+            "DELETE FROM jobs WHERE source = '104' AND external_id NOT IN ({placeholders})"
+        );
+        connection.execute(&query, rusqlite::params_from_iter(current_ids.iter()))?
+    };
+    Ok(deleted)
+}
+
 fn next_scheduled_run() -> Result<Duration> {
     let now = Local::now();
     let today = now.date_naive();
-    for hour in [7, 17] {
+    for (hour, minute) in [(7, 0), (17, 0), (21, 30)] {
         let candidate = today
-            .and_hms_opt(hour, 0, 0)
+            .and_hms_opt(hour, minute, 0)
             .and_then(|time| Local.from_local_datetime(&time).single());
         if let Some(candidate) = candidate.filter(|candidate| *candidate > now) {
             return (candidate - now)
@@ -302,7 +358,7 @@ fn next_scheduled_run() -> Result<Duration> {
         .context("invalid scheduled run duration")
 }
 
-fn run_check(notifier: Option<&LineNotifier>, notify_current: bool) -> Result<()> {
+fn run_check(notifier: Option<&LineNotifier>) -> Result<()> {
     let version: ChromeVersion = reqwest::blocking::get("http://127.0.0.1:9222/json/version")?
         .error_for_status()?
         .json()?;
@@ -313,25 +369,26 @@ fn run_check(notifier: Option<&LineNotifier>, notify_current: bool) -> Result<()
         .context("failed to navigate to the 104 Rust search")?
         .wait_until_navigated()
         .context("104 search page did not finish navigating")?;
-    println!("Title: {:?}", tab.get_title()?);
+    let title = tab.get_title()?;
+    println!("Title: {:?}", title);
     println!("URL: {}", tab.get_url());
     let html = tab.get_content().context("failed to get rendered HTML")?;
     println!("HTML size: {}", html.len());
     println!("Contains Rust: {}", html.contains("Rust"));
-    std::fs::write("job-list.html", html).context("failed to save job list")?;
+    std::fs::write("job-list.html", &html).context("failed to save job list")?;
     println!("Saved rendered job list to job-list.html");
+    if is_challenge_page(&title, &html) {
+        anyhow::bail!("104 returned a Cloudflare challenge; refusing to persist an empty result");
+    }
     thread::sleep(Duration::from_secs(2));
 
     let total_pages = extract_total_pages(&tab)?;
     let mut connection = Connection::open("jobs.sqlite3").context("failed to open jobs.sqlite3")?;
     ensure_schema(&connection)?;
     let known_jobs = load_known_jobs(&connection)?;
-    let incremental_search = !known_jobs.is_empty();
     let mut seen_job_ids = HashSet::new();
-    let mut jobs = Vec::new();
     let mut current_jobs = Vec::new();
     let mut changes = Vec::new();
-    let mut stopped_on_known_job = false;
 
     for page in 1..=total_pages {
         if page > 1 {
@@ -343,66 +400,77 @@ fn run_check(notifier: Option<&LineNotifier>, notify_current: bool) -> Result<()
         }
         let page_jobs = extract_job_list(&tab)
             .with_context(|| format!("failed to extract rendered 104 page {page}"))?;
-        if notify_current && page == 1 {
-            current_jobs = page_jobs.clone();
-        }
         for job in page_jobs {
-            if let Some(previous_job) = known_jobs.get(&job.external_id) {
-                if previous_job != &job {
-                    println!("[UPDATE] {} {}", job.external_id, job.title);
-                    changes.push(format!(
-                        "[UPDATE] {}\n{}\n{}\n{}",
-                        job.title, job.company, job.url, job.external_id
-                    ));
-                    jobs.push(job.clone());
-                }
-                if incremental_search {
-                    stopped_on_known_job = true;
-                    break;
-                }
+            if !seen_job_ids.insert(job.external_id.clone()) {
                 continue;
             }
-            if seen_job_ids.insert(job.external_id.clone()) {
-                println!("[CREATE] {} {}", job.external_id, job.title);
-                changes.push(format!(
-                    "[CREATE] {}\n{}\n{}\n{}",
-                    job.title, job.company, job.url, job.external_id
-                ));
-                jobs.push(job);
+            if let Some(previous_job) = known_jobs.get(&job.external_id) {
+                if previous_job != &job {
+                    println!(
+                        "[Update] {} {} (last updated: {})",
+                        job.external_id,
+                        job.title,
+                        job.published_at.as_deref().unwrap_or("unknown")
+                    );
+                    changes.push(format_change("[Update]", &job));
+                }
+            } else {
+                println!(
+                    "[New] {} {} (last updated: {})",
+                    job.external_id,
+                    job.title,
+                    job.published_at.as_deref().unwrap_or("unknown")
+                );
+                changes.push(format_change("[New]", &job));
             }
+            current_jobs.push(job);
         }
-        println!("Collected page {page}/{total_pages}: {} jobs", jobs.len());
-        if stopped_on_known_job {
-            println!("Stopped after reaching an existing job on page {page}");
-            break;
+        println!(
+            "Collected page {page}/{total_pages}: {} jobs",
+            current_jobs.len()
+        );
+    }
+    if current_jobs.is_empty() {
+        anyhow::bail!("104 returned no job cards; refusing to replace the saved job list");
+    }
+    for (external_id, job) in &known_jobs {
+        if !seen_job_ids.contains(external_id) {
+            println!("[Delete] {} {}", external_id, job.title);
+            changes.push(format_change("[Delete]", job));
         }
     }
-    std::fs::write("job-list.json", serde_json::to_vec_pretty(&jobs)?)
+    std::fs::write("job-list.json", serde_json::to_vec_pretty(&current_jobs)?)
         .context("failed to save extracted job list")?;
     println!(
         "Saved {} unique jobs from {total_pages} pages to job-list.json",
-        jobs.len()
+        current_jobs.len()
     );
-    let persisted = persist_jobs(&mut connection, &jobs)?;
+    let persisted = persist_jobs(&mut connection, &current_jobs)?;
     println!("Persisted {persisted} jobs to jobs.sqlite3");
-    if let Some(notifier) = notifier {
-        let notification = if notify_current {
-            notifier.notify_current(&current_jobs)
-        } else {
-            notifier.notify(&changes)
-        };
-        match notification {
-            Ok(()) if notify_current && !current_jobs.is_empty() => {
-                println!("Sent current results to LINE");
-            }
-            Ok(()) if !notify_current && !changes.is_empty() => {
-                println!("Sent {} job updates to LINE", changes.len());
-            }
-            Ok(()) => {}
+    let deleted = remove_missing_jobs(&connection, &seen_job_ids)?;
+    println!("Removed {deleted} deleted jobs from jobs.sqlite3");
+    if let Some(notifier) = notifier
+        && !changes.is_empty()
+    {
+        match notifier.notify(&changes) {
+            Ok(()) => println!("Sent {} job changes to LINE", changes.len()),
             Err(error) => eprintln!("LINE notification failed: {error:#}"),
         }
     }
     Ok(())
+}
+
+fn format_change(kind: &str, job: &JobListing) -> String {
+    format!(
+        "{kind} {}\n{}\nWork site: {}\nAnnual salary: {}\nLast updated: {}\n{}\n{}",
+        job.title,
+        job.company,
+        job.location.as_deref().unwrap_or("unknown"),
+        job.salary.as_deref().unwrap_or("unknown"),
+        job.published_at.as_deref().unwrap_or("unknown"),
+        job.url,
+        job.external_id
+    )
 }
 
 pub fn run_service() -> Result<()> {
@@ -413,12 +481,15 @@ pub fn run_service() -> Result<()> {
         println!("LINE notifications disabled: credentials are not configured");
     }
     println!("Running initial 104 job check");
-    run_check(notifier.as_ref(), true).context("initial 104 job check failed")?;
+    if let Err(error) = run_check(notifier.as_ref()) {
+        eprintln!("Initial 104 job check failed: {error:#}");
+        eprintln!("The watcher will wait for the next scheduled check");
+    }
     loop {
         let delay = next_scheduled_run()?;
         println!("Next 104 job check in {} seconds", delay.as_secs());
         thread::sleep(delay);
-        if let Err(error) = run_check(notifier.as_ref(), false) {
+        if let Err(error) = run_check(notifier.as_ref()) {
             eprintln!("Scheduled 104 job check failed: {error:#}");
         }
     }
@@ -426,8 +497,9 @@ pub fn run_service() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{JobListing, parse_job_list, persist_jobs};
+    use super::{JobListing, is_challenge_page, parse_job_list, persist_jobs, remove_missing_jobs};
     use rusqlite::Connection;
+    use std::collections::HashSet;
 
     #[test]
     fn parses_the_rendered_104_job_shape() {
@@ -440,6 +512,16 @@ mod tests {
 
         assert_eq!(jobs[0].external_id, "13191931");
         assert_eq!(jobs[0].published_at.as_deref(), Some("8/03"));
+    }
+
+    #[test]
+    fn detects_cloudflare_challenge_pages() {
+        assert!(is_challenge_page("Just a moment...", "challenge-platform"));
+        assert!(!is_challenge_page(
+            "104 jobs",
+            "challenge-platform div data-job-no=13191931"
+        ));
+        assert!(!is_challenge_page("104 jobs", "rendered job cards"));
     }
 
     #[test]
@@ -469,5 +551,22 @@ mod tests {
             .expect("read persisted job");
         assert_eq!(count, 1);
         assert_eq!(title, "updated title");
+
+        let deleted_job = JobListing {
+            external_id: "13191932".to_owned(),
+            title: "deleted title".to_owned(),
+            company: "company".to_owned(),
+            location: None,
+            salary: None,
+            description: None,
+            url: "https://www.104.com.tw/job/deleted".to_owned(),
+            published_at: None,
+        };
+        persist_jobs(&mut connection, &[deleted_job]).expect("insert job to delete");
+        let current_ids = HashSet::from(["13191931".to_owned()]);
+        assert_eq!(
+            remove_missing_jobs(&connection, &current_ids).expect("delete missing jobs"),
+            1
+        );
     }
 }

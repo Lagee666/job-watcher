@@ -4,8 +4,8 @@
 
 Rust Job Watcher is a long-running service.
 
-It performs one synchronization cycle at startup and then at 07:00 and 17:00
-in the machine's local timezone.
+It performs one synchronization cycle at startup and then at 07:00, 17:00, and
+21:30 in the machine's local timezone.
 
 The application maintains the schedule internally.
 
@@ -44,12 +44,13 @@ Compare with SQLite
       │
       ├── New
       ├── Updated
+      ├── Deleted
       └── Unchanged
       │
       ▼
   SQLite (`jobs.sqlite3`)
 
-New / Updated
+New / Updated / Deleted
       │
       ▼
    Log output + LINE notifier
@@ -203,7 +204,8 @@ Scheduling is maintained by the running application.
 In-process scheduler
       │
       ├── 07:00
-      └── 17:00
+      ├── 17:00
+      └── 21:30
              │
              ▼
        Synchronization cycle

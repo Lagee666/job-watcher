@@ -10,3 +10,4 @@
 
 # Browser/test artifacts
 /test-results/
+/dist/

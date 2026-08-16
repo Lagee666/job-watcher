@@ -54,7 +54,7 @@ cargo run
 
 Use `cargo run --release` for an optimized build. The process starts an Axum
 health server on `http://127.0.0.1:3004/` by default and runs the watcher immediately,
-then every day at 07:00 and 17:00 in the machine's local timezone:
+then every day at 07:00, 17:00, and 21:30 in the machine's local timezone:
 
 ```bash
 curl http://127.0.0.1:3004/
@@ -65,6 +65,56 @@ LINE Developers console. The endpoint accepts `POST /webhook` JSON events and
 returns HTTP 200.
 
 Stop the service with `Ctrl-C`.
+
+## Raspberry Pi configuration
+
+### Build the Raspberry Pi binary
+
+The Makefile's Raspberry Pi target is a direct Cargo target build:
+
+```bash
+rustup target add aarch64-unknown-linux-gnu
+make build-rpi
+```
+
+The target runs:
+
+```bash
+cargo build --release --target aarch64-unknown-linux-gnu
+```
+
+When building from an x86 Linux machine, install an AArch64 linker first:
+
+```bash
+sudo apt install gcc-aarch64-linux-gnu
+```
+
+The binary is written to:
+
+```text
+target/aarch64-unknown-linux-gnu/release/job-watcher
+```
+
+Copy the binary to the Pi. The Pi still needs Chromium, its fonts, and the
+configuration file below. A 32-bit Raspberry Pi OS installation needs a
+different Rust target and linker; this Makefile target is currently for
+64-bit Raspberry Pi OS.
+
+For a system deployment, create the configuration directory and copy the
+template outside the repository:
+
+```bash
+sudo install -d -m 750 /etc/job-watcher
+sudo install -m 600 deploy/job-watcher.env.example /etc/job-watcher/job-watcher.env
+sudo editor /etc/job-watcher/job-watcher.env
+```
+
+The service automatically loads `/etc/job-watcher/job-watcher.env` when that
+file exists. It contains the HTTP port and LINE credentials. The local `.env`
+file is used only when the system configuration file does not exist.
+
+Keep the file readable only by the account that runs the service because it
+contains the LINE channel access token.
 
 ## Configure LINE notifications
 
@@ -84,16 +134,17 @@ LINE_USER_ID=your-recipient-user-id
 Both values must be present together. The channel access token comes from the
 LINE Messaging API channel, and the user ID identifies the recipient. Keep
 `.env` private; it is ignored by Git. Without these values, the service still
-prints `[CREATE]` and `[UPDATE]` events locally.
+prints `[New]`, `[Update]`, and `[Delete]` events locally.
 
 ## What to expect
 
-The first check scans every result page. Later checks stop at the first known
-job because the 104 search is configured newest-first. Output includes:
+Every check scans every result page so the current result set can be compared
+with SQLite. Output includes:
 
-- `[CREATE]` for a new external job ID;
-- `[UPDATE]` when an existing job's tracked fields changed;
-- no output for unchanged jobs or jobs absent from the current search.
+- `[New]` for a new external job ID;
+- `[Update]` when an existing job's tracked fields changed;
+- `[Delete]` when a saved job is absent from the current search;
+- no output for unchanged jobs.
 
 The service writes these files in its current directory:
 
@@ -101,9 +152,15 @@ The service writes these files in its current directory:
 - `job-list.json` — latest extracted records;
 - `job-list.html` — rendered first-page capture.
 
-When LINE is configured, startup sends a `[CURRENT]` summary of the first-page
-results. Scheduled checks send create/update events through the LINE Messaging
-API after SQLite persistence succeeds.
+The database stores each job's `last_updated`, `work_site`, and
+`annual_salary`. Existing databases receive these columns automatically on the
+next service start.
+
+When LINE is configured, startup and scheduled checks send changed jobs through
+the LINE Messaging API after SQLite persistence succeeds. A check with no
+changes sends no LINE message. Each check sends at most 4 LINE
+messages, with up to 5 jobs per message; excess results are replaced by a link
+to the 104 search page. Each job notification includes its last updated date.
 
 If Chromium is not listening on port `9222`, the watcher reports a connection
 error. The project uses normal public-page rendering and does not bypass

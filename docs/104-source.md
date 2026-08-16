@@ -412,13 +412,12 @@ The fields are read from the rendered card using these selectors/attributes:
 | `description` | `.info-content` when present; summary cards may have no description |
 
 Because the page uses `vue-recycle-scroller`, extraction scrolls the list,
-collects currently rendered cards, and de-duplicates by `data-job-no`. The first
-run visits every result page. Later runs compare each listing with the full
-record stored in SQLite, print `[CREATE]` for new listings and `[UPDATE]` when
-any tracked field differs, and stop at the first known listing because
-`order=16` is configured as newest-first. Listings absent from the current
-result are not printed as deletions. The ordering assumption remains an
-operational assumption, not a guarantee from a documented API.
+collects currently rendered cards, and de-duplicates by `data-job-no`. Every run
+visits every result page and compares the complete current result set with the
+full records stored in SQLite. It prints `[New]` for new listings, `[Update]`
+when any tracked field differs, and `[Delete]` for previously saved listings
+absent from the current result. The newest-first ordering is useful for
+presentation, but is no longer used to stop the scan.
 
 The watcher writes the raw first-page rendering to `job-list.html` and the
 newly extracted summary records to `job-list.json`. This is a development
