@@ -11,9 +11,8 @@ controls.
 Axum listens on port `3004` by default and accepts `POST /webhook`. Browser,
 SQLite, filesystem, rclone, and LINE work runs off the Tokio executor.
 
-Automatic synchronization runs once daily at `07:00 Asia/Taipei`. Restarting
-the service starts only HTTP and the scheduler; it does not synchronize at
-startup. Automatic `17:00` and `21:30` runs are removed.
+The service synchronizes once at startup and automatically every day at
+`06:30 Asia/Taipei`. Automatic `17:00` and `21:30` runs are removed.
 
 LINE commands:
 
@@ -21,6 +20,8 @@ LINE commands:
 - `今日履歷` reads today's existing `changes/YYYY-MM-DD.json`; it never opens
   104. Repeated changes for one `(source, external_id)` are presented once
   using the latest record.
+- `url` returns today's configured private Google Drive URL or authenticated
+  rclone path without starting a synchronization.
 
 Unknown LINE messages are ignored. If no history exists for today, the reply is
 `今日尚無職缺異動。`.
@@ -36,9 +37,9 @@ cargo run --bin update-jobs
 
 It performs exactly one 104 synchronization, updates local `jobs.sqlite3`,
 `job-list.json`, `job-list.html`, local change history, and only changed
-full-JD batch files under `job-list/` (or `JOB_WATCHER_JD_DIR`). Files are
+full-JD batch files under `changes/` (or `JOB_WATCHER_JD_DIR`). Files are
 written incrementally after every 10 JDs and each batch contains at most 10
-complete JDs. They are placed in a date folder such as `job-list/08-16/`. It uses the
+complete JDs. They are placed in a date folder such as `changes/08-16/`. It uses the
 recent-first list and fetches details for new or potentially changed listings.
 
 To refresh every full JD file, use:
@@ -92,8 +93,11 @@ uploaded. Failed uploads leave local JSON and are reported by LINE. No public
 Drive sharing is enabled; the notification shows the private authenticated
 Drive path. Settings are `JOB_WATCHER_CHANGE_DIR`,
 `JOB_WATCHER_RCLONE_REMOTE`, `JOB_WATCHER_RCLONE_PATH`, and optional
-`JOB_WATCHER_RCLONE_CONFIG`. `JOB_WATCHER_JD_DIR` controls the local full-JD
-batch folder and defaults to `job-list`.
+`JOB_WATCHER_RCLONE_CONFIG`. `JOB_WATCHER_DRIVE_URL` may contain a real private
+Google Drive URL for the daily change file; it is never generated as a fake
+public URL. `JOB_WATCHER_JD_DIR` controls the local full-JD batch folder and
+defaults to `changes`. The daemon uses the same date-folder and 10-JD batch
+layout as the one-shot updater.
 
 ## Raspberry Pi / rclone
 

@@ -100,7 +100,6 @@ impl SyncSummary {
 struct LineNotifier {
     channel_access_token: String,
     user_id: String,
-    client: reqwest::blocking::Client,
 }
 
 #[derive(Serialize)]
@@ -133,12 +132,11 @@ impl LineNotifier {
             (Some(channel_access_token), Some(user_id)) => Ok(Some(Self {
                 channel_access_token,
                 user_id,
-                client: reqwest::blocking::Client::new(),
             })),
         }
     }
     fn send_text(&self, text: &str) -> Result<()> {
-        self.client
+        reqwest::blocking::Client::new()
             .post("https://api.line.me/v2/bot/message/push")
             .bearer_auth(&self.channel_access_token)
             .json(&LinePushRequest {
@@ -155,7 +153,7 @@ impl LineNotifier {
         Ok(())
     }
     fn reply_text(&self, reply_token: &str, text: &str) -> Result<()> {
-        self.client
+        reqwest::blocking::Client::new()
             .post("https://api.line.me/v2/bot/message/reply")
             .bearer_auth(&self.channel_access_token)
             .json(&LineReplyRequest {
@@ -264,6 +262,7 @@ pub fn handle_webhook(payload: Value, service: Service) {
         thread::spawn(move || {
             let message = match command {
                 "today" => today_digest(),
+                "url" => drive_url_digest(),
                 _ => {
                     let execute_time = current_execution_time();
                     let started =
@@ -287,11 +286,18 @@ pub fn handle_webhook(payload: Value, service: Service) {
                     }
                 }
             };
-            let result = if command == "today" {
+            let result = if matches!(command, "today" | "url") {
                 if let Some(token) = reply_token.as_deref() {
-                    service
-                        .reply_to_line_event(token, &message)
-                        .or_else(|_| service.reply_text(&message))
+                    match service.reply_to_line_event(token, &message) {
+                        Ok(()) => Ok(()),
+                        Err(reply_error) => {
+                            error!(
+                                error = %reply_error,
+                                "LINE reply failed; attempting push-message fallback"
+                            );
+                            service.reply_text(&message)
+                        }
+                    }
                 } else {
                     service.reply_text(&message)
                 }
@@ -309,8 +315,9 @@ pub fn handle_webhook(payload: Value, service: Service) {
 
 fn command_for(text: &str) -> Option<&'static str> {
     match text.trim() {
-        "更新JD" => Some("update"),
+        "url" | "GoogleUrl" => Some("url"),
         "今日履歷" => Some("today"),
+        "更新JD" => Some("update"),
         _ => None,
     }
 }
@@ -580,7 +587,7 @@ fn history_path(date: NaiveDate) -> PathBuf {
 fn job_file_dir() -> PathBuf {
     std::env::var_os("JOB_WATCHER_JD_DIR")
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("job-list"))
+        .unwrap_or_else(|| PathBuf::from("changes"))
 }
 
 struct JobFileWriter {
@@ -674,7 +681,12 @@ fn rotate_job_files(root: &Path) -> Result<()> {
 
 fn append_history(summary: &SyncSummary) -> Result<PathBuf> {
     let dir = history_dir();
-    fs::create_dir_all(&dir).context("failed to create change history directory")?;
+    fs::create_dir_all(&dir).with_context(|| {
+        format!(
+            "failed to create change history directory {}",
+            dir.display()
+        )
+    })?;
     let path = history_path(NaiveDate::parse_from_str(&summary.date, "%Y-%m-%d")?);
     let mut history = if path.is_file() {
         serde_json::from_slice::<ChangeHistory>(
@@ -973,13 +985,13 @@ fn synchronize(
                 info!("local update mode: cloud upload skipped");
             } else {
                 match cloud_sync(date) {
-                    Ok(location) => {
-                        if let Some(location) = &location {
-                            info!(location = %location, "change history uploaded");
-                        } else {
-                            debug!("rclone upload skipped because no remote is configured");
-                        }
-                        summary.cloud_location = location;
+                    Ok(Some(_remote_location)) => {
+                        let location = cloud_location(date);
+                        info!(location = %location, "change history uploaded");
+                        summary.cloud_location = Some(location);
+                    }
+                    Ok(None) => {
+                        debug!("rclone upload skipped because no remote is configured");
                     }
                     Err(error) => {
                         error!(error = %error, "change-history upload failed");
@@ -989,18 +1001,20 @@ fn synchronize(
             }
         }
         Err(error) => {
-            error!(error = %error, "change-history export failed");
+            error!(error = %error, error_chain = ?error, "change-history export failed");
             summary.export_error = Some(format!("{error:#}"));
         }
     }
-    if matches!(trigger, "scheduled" | "local-cli" | "local-cli-all")
-        && let Some(notifier) = notifier
+    if matches!(
+        trigger,
+        "startup" | "scheduled" | "local-cli" | "local-cli-all"
+    ) && let Some(notifier) = notifier
         && let Err(error) = notifier.send_text(&summary_digest(
             &summary,
-            if trigger == "scheduled" {
-                "104 每日履歷更新\n同步完成"
-            } else {
-                "104 Job Watcher\n更新完成"
+            match trigger {
+                "scheduled" => "104 每日履歷更新\n同步完成",
+                "startup" => "104 Job Watcher\n啟動更新完成",
+                _ => "104 Job Watcher\n更新完成",
             },
         ))
     {
@@ -1101,15 +1115,21 @@ fn summary_digest(summary: &SyncSummary, heading: &str) -> String {
 
 fn today_digest() -> String {
     let Ok(now) = taipei_now() else {
+        error!("cannot determine Asia/Taipei time while reading today's history");
         return "今日履歷資料無法讀取。".into();
     };
     let date = now.date_naive();
     let path = history_path(date);
     let Ok(bytes) = fs::read(&path) else {
+        debug!(path = %path.display(), "today's change history does not exist");
         return "今日尚無職缺異動。".into();
     };
-    let Ok(history) = serde_json::from_slice::<ChangeHistory>(&bytes) else {
-        return "今日履歷資料無法讀取。".into();
+    let history = match serde_json::from_slice::<ChangeHistory>(&bytes) {
+        Ok(history) => history,
+        Err(error) => {
+            error!(path = %path.display(), error = %error, "today's change history is invalid");
+            return "今日履歷資料無法讀取。".into();
+        }
     };
     let mut by_id: HashMap<(String, String), ChangeRecord> = HashMap::new();
     for run in history.runs {
@@ -1134,12 +1154,44 @@ fn today_digest() -> String {
             _ => {}
         }
     }
-    if std::env::var_os("JOB_WATCHER_RCLONE_REMOTE").is_some() {
+    if std::env::var_os("JOB_WATCHER_RCLONE_REMOTE").is_some()
+        || std::env::var_os("JOB_WATCHER_DRIVE_URL").is_some()
+    {
         summary.cloud_location = Some(cloud_location(date));
     }
     summary_digest(&summary, "今日履歷")
 }
+
+fn drive_url_digest() -> String {
+    let Ok(now) = taipei_now() else {
+        error!("cannot determine Asia/Taipei time while building Drive location");
+        return "Google Drive URL 無法取得。".into();
+    };
+    let has_location = std::env::var_os("JOB_WATCHER_DRIVE_URL").is_some()
+        || std::env::var_os("JOB_WATCHER_RCLONE_REMOTE").is_some();
+    if !has_location {
+        error!(
+            "Drive location requested but JOB_WATCHER_DRIVE_URL and JOB_WATCHER_RCLONE_REMOTE are both unset"
+        );
+        return "Google Drive URL 尚未設定。".into();
+    }
+    let location = cloud_location(now.date_naive());
+    let label = if std::env::var_os("JOB_WATCHER_DRIVE_URL").is_some() {
+        "Google Drive URL"
+    } else {
+        "Google Drive 路徑"
+    };
+    format!("今日完整 JD：\n{label}\n{location}")
+}
+
 fn cloud_location(date: NaiveDate) -> String {
+    if let Ok(base_url) = std::env::var("JOB_WATCHER_DRIVE_URL") {
+        return format!(
+            "{}/{}.json",
+            base_url.trim_end_matches('/'),
+            date.format("%Y-%m-%d")
+        );
+    }
     let remote = std::env::var("JOB_WATCHER_RCLONE_REMOTE").unwrap_or_else(|_| "未設定".into());
     let path = std::env::var("JOB_WATCHER_RCLONE_PATH")
         .unwrap_or_else(|_| "104-job-watcher/changes".into());
@@ -1151,7 +1203,7 @@ fn next_scheduled_run() -> Result<Duration> {
     let now = Utc::now().with_timezone(&offset);
     let today = now.date_naive();
     let candidate = |date: NaiveDate| match offset
-        .from_local_datetime(&date.and_hms_opt(7, 0, 0).context("invalid 07:00")?)
+        .from_local_datetime(&date.and_hms_opt(6, 30, 0).context("invalid 06:30")?)
     {
         LocalResult::Single(value) => Ok(value),
         _ => anyhow::bail!("ambiguous Taipei scheduled time"),
@@ -1174,9 +1226,10 @@ fn next_scheduled_run() -> Result<Duration> {
 }
 
 pub fn run_service(service: Service) -> Result<()> {
-    info!(
-        "automatic synchronization schedule is 07:00 Asia/Taipei; startup synchronization disabled"
-    );
+    info!("running startup synchronization; automatic schedule is 06:30 Asia/Taipei");
+    if let Err(error) = service.try_synchronize("startup") {
+        error!(error = %error, "startup synchronization failed");
+    }
     loop {
         let delay = next_scheduled_run()?;
         info!(
@@ -1232,6 +1285,7 @@ mod tests {
     fn line_commands_are_exact_and_unknown_text_is_ignored() {
         assert_eq!(command_for("更新JD"), Some("update"));
         assert_eq!(command_for(" 今日履歷 "), Some("today"));
+        assert_eq!(command_for("url"), Some("url"));
         assert_eq!(command_for("更新JD now"), None);
         assert_eq!(command_for("hello"), None);
     }

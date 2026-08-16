@@ -9,12 +9,23 @@ use job_watcher::{load_environment, watcher};
 use serde_json::Value;
 use std::net::SocketAddr;
 use tokio::task::spawn_blocking;
-use tracing::info;
+use tracing::{Level, error, info};
 
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() {
+    tracing_subscriber::fmt()
+        .with_max_level(Level::DEBUG)
+        .with_target(true)
+        .with_line_number(true)
+        .init();
+    if let Err(error) = run().await {
+        error!(error = %error, "Job Watcher terminated with an error");
+        std::process::exit(1);
+    }
+}
+
+async fn run() -> Result<()> {
     load_environment()?;
-    tracing_subscriber::fmt().with_target(false).init();
     let service = watcher::Service::new()?;
     let app = Router::new()
         .route("/", get(|| async { "Rust Job Watcher is running" }))

@@ -13,14 +13,15 @@ is history/export only and is never used as current state.
 ## Runtime paths
 
 Axum and the in-process scheduler share a `Service`. The scheduler waits for
-the next `07:00 Asia/Taipei` instant; startup does not synchronize. Webhook
-handling recognizes only `更新JD` and `今日履歷`. Browser, SQLite, filesystem,
+startup and then the next `06:30 Asia/Taipei` instant. Webhook
+handling recognizes `更新JD`, `今日履歷`, and `url`. Browser, SQLite, filesystem,
 rclone, and LINE calls run on blocking threads rather than Tokio executor
 threads.
 
 `更新JD` uses a process-local mutex guard. If another cycle owns it, the caller
 gets `目前正在更新 JD，請稍後再試。`. `今日履歷` does not acquire the guard or
-contact 104.
+contact 104. `url` is also read-only and returns the configured current-day
+Drive location without contacting 104.
 
 ## Synchronization pipeline
 
@@ -46,7 +47,7 @@ recent-first search result as a pre-filter, writes only changed/new full JDs,
 and does not initialize Axum or scheduling. `JOB_WATCHER_LINE_BOT=true` enables
 LINE completion delivery and configured cloud upload; when false, output is
 local files plus tracing logs. Full JDs are stored
-under `JOB_WATCHER_JD_DIR` (default `job-list/`) as timestamped JSON batches
+under `JOB_WATCHER_JD_DIR` (default `changes/`) as timestamped JSON batches
 containing at most 10 jobs per file. Batches are streamed to disk after each
 group of 10 jobs under a date folder such as `08-16/`.
 

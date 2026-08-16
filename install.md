@@ -60,18 +60,20 @@ cargo run --bin update-jobs
 
 This binary writes `jobs.sqlite3`, `job-list.json`, `job-list.html`, and local
 `changes/YYYY-MM-DD.json`, plus only changed full-JD batch files under a date
-folder such as `job-list/08-16/`, with at most 10 JDs per file. Each completed
+folder such as `changes/08-16/`, with at most 10 JDs per file. Each completed
 group of 10 JDs is written immediately while processing. Set
 `JOB_WATCHER_LINE_BOT=true` to send the completion digest to LINE and enable
 configured cloud upload; otherwise it only writes local files and tracing logs.
 Use `cargo run --bin update-jobs-all` to refresh every JD batch.
 Batch files use names such as `jd-20260816T1430120800-001.json`; files and
 empty date folders older than seven days are removed. Set
-`JOB_WATCHER_JD_DIR` to change the root folder.
+`JOB_WATCHER_JD_DIR` to change the root folder. The daemon uses the same
+date-folder and 10-JD batch layout as the one-shot updater.
 
 Use `cargo run --release` for an optimized build. The process starts an Axum
 health server on `http://127.0.0.1:3004/` by default and runs the watcher immediately,
-then every day at 07:00 Asia/Taipei. Startup does not perform a synchronization:
+then every day at 06:30 Asia/Taipei. The service also performs one
+synchronization when it starts:
 
 ```bash
 curl http://127.0.0.1:3004/
@@ -174,10 +176,12 @@ The database stores each job's `last_updated`, `work_site`, and
 `annual_salary`. Existing databases receive these columns automatically on the
 next service start.
 
-When LINE is configured, the scheduled 07:00 check sends a daily count digest
-after SQLite/history persistence. `更新JD` runs the same pipeline immediately;
-`今日履歷` reads today's local history without contacting 104. Complete changed
-JDs are in the private Drive path shown in the digest.
+When LINE is configured, startup and the scheduled 06:30 check send a daily
+count digest after SQLite/history persistence. `更新JD` runs the same pipeline immediately;
+`今日履歷` reads today's local history without contacting 104. `url` returns
+today's configured private Drive URL or authenticated rclone path without
+contacting 104. Complete changed JDs are in the private Drive path shown in the
+digest.
 
 Install and configure rclone separately:
 
@@ -188,7 +192,9 @@ rclone lsd gdrive:
 ```
 
 Set `JOB_WATCHER_RCLONE_REMOTE`, `JOB_WATCHER_RCLONE_PATH`, and preferably
-`JOB_WATCHER_RCLONE_CONFIG` in the systemd environment. Systemd may use a
+`JOB_WATCHER_RCLONE_CONFIG` in the systemd environment. Optionally set
+`JOB_WATCHER_DRIVE_URL` to a real private Drive URL for the daily JSON file.
+Systemd may use a
 different HOME than an interactive shell. The service syncs only the configured
 change directory and never uploads `jobs.sqlite3` or changes Drive sharing.
 
