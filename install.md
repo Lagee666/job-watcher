@@ -52,9 +52,26 @@ In a second terminal, start the service:
 cargo run
 ```
 
+For a one-shot local update without the LINE bot, scheduler, or cloud upload:
+
+```bash
+cargo run --bin update-jobs
+```
+
+This binary writes `jobs.sqlite3`, `job-list.json`, `job-list.html`, and local
+`changes/YYYY-MM-DD.json`, plus only changed full-JD batch files under a date
+folder such as `job-list/08-16/`, with at most 10 JDs per file. Each completed
+group of 10 JDs is written immediately while processing. Set
+`JOB_WATCHER_LINE_BOT=true` to send the completion digest to LINE and enable
+configured cloud upload; otherwise it only writes local files and tracing logs.
+Use `cargo run --bin update-jobs-all` to refresh every JD batch.
+Batch files use names such as `jd-20260816T1430120800-001.json`; files and
+empty date folders older than seven days are removed. Set
+`JOB_WATCHER_JD_DIR` to change the root folder.
+
 Use `cargo run --release` for an optimized build. The process starts an Axum
 health server on `http://127.0.0.1:3004/` by default and runs the watcher immediately,
-then every day at 07:00, 17:00, and 21:30 in the machine's local timezone:
+then every day at 07:00 Asia/Taipei. Startup does not perform a synchronization:
 
 ```bash
 curl http://127.0.0.1:3004/
@@ -110,8 +127,9 @@ sudo editor /etc/job-watcher/job-watcher.env
 ```
 
 The service automatically loads `/etc/job-watcher/job-watcher.env` when that
-file exists. It contains the HTTP port and LINE credentials. The local `.env`
-file is used only when the system configuration file does not exist.
+file exists. It contains the HTTP port, LINE credentials, change directory, and
+optional rclone settings. The local `.env` file is used only when the system
+configuration file does not exist.
 
 Keep the file readable only by the account that runs the service because it
 contains the LINE channel access token.
@@ -156,11 +174,23 @@ The database stores each job's `last_updated`, `work_site`, and
 `annual_salary`. Existing databases receive these columns automatically on the
 next service start.
 
-When LINE is configured, startup and scheduled checks send changed jobs through
-the LINE Messaging API after SQLite persistence succeeds. A check with no
-changes sends no LINE message. Each check sends at most 4 LINE
-messages, with up to 5 jobs per message; excess results are replaced by a link
-to the 104 search page. Each job notification includes its last updated date.
+When LINE is configured, the scheduled 07:00 check sends a daily count digest
+after SQLite/history persistence. `更新JD` runs the same pipeline immediately;
+`今日履歷` reads today's local history without contacting 104. Complete changed
+JDs are in the private Drive path shown in the digest.
+
+Install and configure rclone separately:
+
+```bash
+sudo apt install rclone
+rclone config
+rclone lsd gdrive:
+```
+
+Set `JOB_WATCHER_RCLONE_REMOTE`, `JOB_WATCHER_RCLONE_PATH`, and preferably
+`JOB_WATCHER_RCLONE_CONFIG` in the systemd environment. Systemd may use a
+different HOME than an interactive shell. The service syncs only the configured
+change directory and never uploads `jobs.sqlite3` or changes Drive sharing.
 
 If Chromium is not listening on port `9222`, the watcher reports a connection
 error. The project uses normal public-page rendering and does not bypass

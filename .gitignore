@@ -5,7 +5,9 @@
 /Cargo.lock
 /job-list.html
 /job-list.json
+/job-list/
 /jobs.sqlite3
+/changes/
 /.env
 
 # Browser/test artifacts

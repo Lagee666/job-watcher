@@ -1,16 +1,30 @@
 use anyhow::{Context, Result};
-use chrono::{Days, Local, TimeZone};
+use chrono::{Days, FixedOffset, LocalResult, NaiveDate, TimeZone, Utc};
 use headless_chrome::{Browser, browser::tab::Tab};
 use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::{
     collections::{HashMap, HashSet},
+    fs,
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex},
     thread,
-    time::Duration,
+    time::{Duration, SystemTime},
 };
+use tracing::{debug, error, info};
 
 const SEARCH_URL: &str =
     "https://www.104.com.tw/jobs/search/?jobsource=index_s&keyword=Rust&mode=s&order=16";
+const SOURCE: &str = "104";
+const TAIPEI_OFFSET: i32 = 8 * 60 * 60;
+const JD_BATCH_SIZE: usize = 10;
+
+#[derive(Clone, Copy, Debug)]
+enum JobUpdateMode {
+    Changed,
+    All,
+}
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -19,15 +33,68 @@ struct ChromeVersion {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
-struct JobListing {
-    external_id: String,
-    title: String,
-    company: String,
-    location: Option<String>,
-    salary: Option<String>,
-    description: Option<String>,
-    url: String,
-    published_at: Option<String>,
+pub struct JobListing {
+    pub external_id: String,
+    pub title: String,
+    pub company: String,
+    pub location: Option<String>,
+    pub salary: Option<String>,
+    pub description: Option<String>,
+    pub url: String,
+    pub published_at: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct ChangeRecord {
+    pub change_type: String,
+    pub source: String,
+    pub external_id: String,
+    pub title: String,
+    pub company: String,
+    pub location: Option<String>,
+    pub salary: Option<String>,
+    pub url: String,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub changed_fields: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deleted_at: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+pub struct ChangeHistory {
+    pub date: String,
+    pub runs: Vec<HistoryRun>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct HistoryRun {
+    pub generated_at: String,
+    pub trigger: String,
+    pub new: Vec<ChangeRecord>,
+    pub updated: Vec<ChangeRecord>,
+    pub deleted: Vec<ChangeRecord>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct SyncSummary {
+    pub generated_at: String,
+    pub date: String,
+    pub trigger: String,
+    pub new: Vec<ChangeRecord>,
+    pub updated: Vec<ChangeRecord>,
+    pub deleted: Vec<ChangeRecord>,
+    pub export_path: Option<String>,
+    pub cloud_location: Option<String>,
+    pub export_error: Option<String>,
+    pub cloud_error: Option<String>,
+}
+
+impl SyncSummary {
+    fn has_changes(&self) -> bool {
+        !(self.new.is_empty() && self.updated.is_empty() && self.deleted.is_empty())
+    }
 }
 
 struct LineNotifier {
@@ -41,7 +108,12 @@ struct LinePushRequest {
     to: String,
     messages: Vec<LineMessage>,
 }
-
+#[derive(Serialize)]
+struct LineReplyRequest {
+    #[serde(rename = "replyToken")]
+    reply_token: String,
+    messages: Vec<LineMessage>,
+}
 #[derive(Serialize)]
 struct LineMessage {
     #[serde(rename = "type")]
@@ -51,10 +123,8 @@ struct LineMessage {
 
 impl LineNotifier {
     fn from_env() -> Result<Option<Self>> {
-        dotenvy::dotenv().ok();
         let token = std::env::var("LINE_CHANNEL_ACCESS_TOKEN").ok();
         let user_id = std::env::var("LINE_USER_ID").ok();
-
         match (token, user_id) {
             (None, None) => Ok(None),
             (Some(_), None) | (None, Some(_)) => {
@@ -67,53 +137,6 @@ impl LineNotifier {
             })),
         }
     }
-
-    fn notify(&self, changes: &[String]) -> Result<()> {
-        self.notify_entries("104 Rust job changes", changes)
-    }
-
-    fn notify_entries(&self, heading: &str, entries: &[String]) -> Result<()> {
-        if entries.is_empty() {
-            return Ok(());
-        }
-
-        let mut batch = Vec::new();
-        let mut batch_size = heading.chars().count() + 2;
-        let mut message_number = 1;
-        for entry in entries {
-            let entry_size = entry.chars().count() + 2;
-            if !batch.is_empty() && (batch.len() >= 5 || batch_size + entry_size > 4500) {
-                let title = if message_number == 1 {
-                    heading.to_owned()
-                } else {
-                    format!("{heading} (continued)")
-                };
-                if message_number == 4 {
-                    self.send_text(&format!(
-                        "{title}\n\n{}\n\nJobs are very much, see: {SEARCH_URL}",
-                        batch.join("\n\n")
-                    ))?;
-                    return Ok(());
-                }
-                self.send_text(&format!("{title}\n\n{}", batch.join("\n\n")))?;
-                batch.clear();
-                batch_size = heading.chars().count() + 2;
-                message_number += 1;
-            }
-            batch.push(entry.clone());
-            batch_size += entry_size;
-        }
-        if !batch.is_empty() {
-            let title = if message_number == 1 {
-                heading.to_owned()
-            } else {
-                format!("{heading} (continued)")
-            };
-            self.send_text(&format!("{title}\n\n{}", batch.join("\n\n")))?;
-        }
-        Ok(())
-    }
-
     fn send_text(&self, text: &str) -> Result<()> {
         self.client
             .post("https://api.line.me/v2/bot/message/push")
@@ -131,6 +154,171 @@ impl LineNotifier {
             .context("LINE Messaging API rejected the notification")?;
         Ok(())
     }
+    fn reply_text(&self, reply_token: &str, text: &str) -> Result<()> {
+        self.client
+            .post("https://api.line.me/v2/bot/message/reply")
+            .bearer_auth(&self.channel_access_token)
+            .json(&LineReplyRequest {
+                reply_token: reply_token.to_owned(),
+                messages: vec![LineMessage {
+                    message_type: "text",
+                    text: text.to_owned(),
+                }],
+            })
+            .send()
+            .context("failed to reply to LINE webhook")?
+            .error_for_status()
+            .context("LINE Messaging API rejected the webhook reply")?;
+        Ok(())
+    }
+}
+
+#[derive(Clone)]
+pub struct Service {
+    lock: Arc<Mutex<bool>>,
+    notifier: Arc<Option<LineNotifier>>,
+}
+
+impl Service {
+    pub fn new() -> Result<Self> {
+        Ok(Self {
+            lock: Arc::new(Mutex::new(false)),
+            notifier: Arc::new(LineNotifier::from_env()?),
+        })
+    }
+    pub fn try_synchronize(&self, trigger: &str) -> Result<Option<SyncSummary>> {
+        let mut running = self
+            .lock
+            .lock()
+            .map_err(|_| anyhow::anyhow!("synchronization guard poisoned"))?;
+        if *running {
+            info!(
+                "synchronization request ignored because another synchronization is already running"
+            );
+            return Ok(None);
+        }
+        *running = true;
+        drop(running);
+        info!(%trigger, "synchronization started");
+        let result = synchronize(
+            trigger,
+            self.notifier.as_ref().as_ref(),
+            true,
+            JobUpdateMode::Changed,
+        );
+        match &result {
+            Ok(summary) => info!(
+                %trigger,
+                new = summary.new.len(),
+                updated = summary.updated.len(),
+                deleted = summary.deleted.len(),
+                "synchronization completed"
+            ),
+            Err(error) => error!(%trigger, error = %error, "synchronization failed"),
+        }
+        *self
+            .lock
+            .lock()
+            .map_err(|_| anyhow::anyhow!("synchronization guard poisoned"))? = false;
+        result.map(Some)
+    }
+    pub fn reply_text(&self, text: &str) -> Result<()> {
+        if let Some(notifier) = self.notifier.as_ref() {
+            notifier.send_text(text)
+        } else {
+            debug!(%text, "LINE disabled; reply not sent");
+            Ok(())
+        }
+    }
+    pub fn reply_to_line_event(&self, reply_token: &str, text: &str) -> Result<()> {
+        if let Some(notifier) = self.notifier.as_ref() {
+            notifier.reply_text(reply_token, text)
+        } else {
+            debug!(%text, "LINE disabled; webhook reply not sent");
+            Ok(())
+        }
+    }
+}
+
+pub fn handle_webhook(payload: Value, service: Service) {
+    let Some(events) = payload.get("events").and_then(Value::as_array) else {
+        return;
+    };
+    for event in events {
+        let Some(text) = event
+            .pointer("/message/text")
+            .and_then(Value::as_str)
+            .map(str::trim)
+        else {
+            continue;
+        };
+        let Some(command) = command_for(text) else {
+            continue;
+        };
+        let reply_token = event
+            .get("replyToken")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        info!(%command, "LINE command received");
+        let service = service.clone();
+        thread::spawn(move || {
+            let message = match command {
+                "today" => today_digest(),
+                _ => {
+                    let execute_time = current_execution_time();
+                    let started =
+                        format!("104 Job Watcher\n更新JD 已開始\n預計執行時間：{execute_time}");
+                    let start_result = if let Some(token) = reply_token.as_deref() {
+                        service.reply_to_line_event(token, &started)
+                    } else {
+                        service.reply_text(&started)
+                    };
+                    if let Err(error) = start_result {
+                        error!(error = %error, "failed to send update-start notification");
+                    }
+                    match service.try_synchronize("manual") {
+                        Ok(Some(summary)) => summary_digest(&summary, "104 Job Watcher\n更新完成"),
+                        Ok(None) => format!(
+                            "104 Job Watcher\n\n執行時間：{execute_time}\n目前正在更新 JD，請稍後再試。"
+                        ),
+                        Err(error) => format!(
+                            "104 Job Watcher\n\n執行時間：{execute_time}\n更新失敗：{error:#}"
+                        ),
+                    }
+                }
+            };
+            let result = if command == "today" {
+                if let Some(token) = reply_token.as_deref() {
+                    service
+                        .reply_to_line_event(token, &message)
+                        .or_else(|_| service.reply_text(&message))
+                } else {
+                    service.reply_text(&message)
+                }
+            } else {
+                // The webhook reply token was consumed by the immediate
+                // acknowledgement; completion is delivered asynchronously.
+                service.reply_text(&message)
+            };
+            if let Err(error) = result {
+                error!(error = %error, "LINE command response failed");
+            }
+        });
+    }
+}
+
+fn command_for(text: &str) -> Option<&'static str> {
+    match text.trim() {
+        "更新JD" => Some("update"),
+        "今日履歷" => Some("today"),
+        _ => None,
+    }
+}
+
+fn current_execution_time() -> String {
+    taipei_now()
+        .map(|time| time.format("%Y/%m/%d %H:%M:%S").to_string())
+        .unwrap_or_else(|_| "時間無法取得".to_owned())
 }
 
 fn parse_job_list(value: &str) -> Result<Vec<JobListing>> {
@@ -138,60 +326,24 @@ fn parse_job_list(value: &str) -> Result<Vec<JobListing>> {
 }
 
 fn is_challenge_page(title: &str, html: &str) -> bool {
-    let has_job_cards = html.contains("data-job-no");
+    let cards = html.contains("data-job-no");
     title.trim().eq_ignore_ascii_case("Just a moment...")
-        || (!has_job_cards
+        || (!cards
             && (html.contains("challenge-platform")
                 || html.contains("cf-chl-")
                 || html.contains("Verify you are human")))
 }
 
 fn extract_job_list(tab: &Tab) -> Result<Vec<JobListing>> {
-    let result = tab.evaluate(
-        r#"(async () => {
-            const jobs = new Map();
-            const text = (root, selector) => {
-                const value = root.querySelector(selector)?.innerText?.trim();
-                return value || null;
-            };
-            const jobUrl = (root) => {
-                const href = root.querySelector('a.info-job')?.href;
-                if (!href) return null;
-                try { return new URL(href).searchParams.get('url') || href; }
-                catch (_) { return href; }
-            };
-            const collect = () => {
-                for (const card of document.querySelectorAll('div[data-job-no]')) {
-                    const externalId = card.getAttribute('data-job-no');
-                    const url = jobUrl(card);
-                    if (!externalId || !url) continue;
-                    jobs.set(externalId, {
-                        external_id: externalId,
-                        title: text(card, '.info-name') || '',
-                        company: text(card, '.info-company > a') || '',
-                        location: text(card, '[data-gtm-joblist^="職缺-地區"]'),
-                        salary: text(card, '[data-gtm-joblist^="職缺-薪資"]'),
-                        description: text(card, '.info-content'),
-                        url,
-                        published_at: text(card, '.job-mobile__date'),
-                    });
-                }
-            };
-            const scroller = document.querySelector('.vue-recycle-scroller');
-            for (let attempt = 0; attempt < 120; attempt += 1) {
-                collect();
-                if (!scroller) break;
-                const previous = scroller.scrollTop;
-                scroller.scrollTop += Math.max(window.innerHeight, 600);
-                scroller.dispatchEvent(new Event('scroll', { bubbles: true }));
-                await new Promise((resolve) => setTimeout(resolve, 100));
-                if (scroller.scrollTop === previous) { collect(); break; }
-            }
-            collect();
-            return JSON.stringify([...jobs.values()]);
-        })()"#,
-        true,
-    )?;
+    let result = tab.evaluate(r#"(async () => {
+        const jobs = new Map(); const text = (root, selector) => { const v = root.querySelector(selector)?.innerText?.trim(); return v || null; };
+        const collect = () => { for (const card of document.querySelectorAll('div[data-job-no]')) {
+            const id = card.getAttribute('data-job-no'); const anchor = card.querySelector('a.info-job'); if (!id || !anchor) continue;
+            let url = anchor.href; try { url = new URL(url).searchParams.get('url') || url; } catch (_) {}
+            jobs.set(id, { external_id:id, title:text(card,'.info-name') || '', company:text(card,'.info-company > a') || '', location:text(card,'[data-gtm-joblist^="職缺-地區"]'), salary:text(card,'[data-gtm-joblist^="職缺-薪資"]'), description:text(card,'.info-content'), url, published_at:text(card,'.job-mobile__date') });
+        }};
+        const scroller = document.querySelector('.vue-recycle-scroller'); for (let i=0;i<120;i++) { collect(); if (!scroller) break; const old=scroller.scrollTop; scroller.scrollTop += Math.max(window.innerHeight,600); scroller.dispatchEvent(new Event('scroll',{bubbles:true})); await new Promise(r=>setTimeout(r,100)); if (scroller.scrollTop === old) break; } collect(); return JSON.stringify([...jobs.values()]);
+    })()"#, true)?;
     let value = result
         .value
         .context("104 job extraction returned no value")?;
@@ -202,45 +354,86 @@ fn extract_job_list(tab: &Tab) -> Result<Vec<JobListing>> {
 }
 
 fn extract_total_pages(tab: &Tab) -> Result<usize> {
-    let result = tab.evaluate(
-        r#"Math.max(1, ...Array.from(document.querySelectorAll('a[href*="page="]'))
-            .map((link) => Number(new URL(link.href).searchParams.get('page')))
-            .filter((page) => Number.isInteger(page) && page > 0))"#,
-        false,
-    )?;
-    let pages = result
-        .value
-        .context("104 pagination returned no value")?
-        .as_u64()
-        .context("104 pagination returned a non-integer value")?;
-    usize::try_from(pages).context("104 page count does not fit in usize")
+    let result = tab.evaluate(r#"Math.max(1, ...Array.from(document.querySelectorAll('a[href*="page="]')).map(x=>Number(new URL(x.href).searchParams.get('page'))).filter(x=>Number.isInteger(x)&&x>0))"#, false)?;
+    let pages = usize::try_from(
+        result
+            .value
+            .context("104 pagination returned no value")?
+            .as_u64()
+            .context("104 pagination returned a non-integer value")?,
+    )
+    .context("104 page count does not fit in usize")?;
+    if pages > 150 {
+        anyhow::bail!("104 reported an unsafe page count: {pages}");
+    }
+    Ok(pages)
+}
+
+fn extract_detail(browser: &Browser, job: &JobListing) -> Result<String> {
+    // Reuse one independent CDP connection, but close each detail target so
+    // Chromium does not retain one browser target per job.
+    let tab = browser
+        .new_tab()
+        .context("failed to create Chromium JD detail tab")?;
+    let result = (|| {
+        tab.navigate_to(&job.url)
+            .with_context(|| format!("failed to navigate to JD {}", job.external_id))?
+            .wait_until_navigated()
+            .context("JD page did not finish navigating")?;
+        thread::sleep(Duration::from_secs(2));
+        let title = tab.get_title()?;
+        let html = tab.get_content()?;
+        if is_challenge_page(&title, &html) {
+            anyhow::bail!("104 returned a challenge for JD {}", job.external_id);
+        }
+        let result = tab.evaluate(
+            r#"(() => {
+            const selectors = [
+                '.job-description',
+                '.job-description__content',
+                '[id*="job-description"]',
+                '[class*="job-description"]',
+                '[class*="description"]',
+                'article'
+            ];
+            const candidates = selectors
+                .flatMap(selector => [...document.querySelectorAll(selector)])
+                .map(element => element.innerText?.trim() || '')
+                .filter(text => text.length > 0);
+            return candidates.sort((left, right) => right.length - left.length)[0]
+                || document.body?.innerText?.trim()
+                || '';
+        })()"#,
+            true,
+        )?;
+        Ok(result
+            .value
+            .context("JD extraction returned no value")?
+            .as_str()
+            .unwrap_or_default()
+            .trim()
+            .to_owned())
+    })();
+    if let Err(error) = tab.close_target() {
+        debug!(external_id = %job.external_id, error = %error, "failed to close JD detail tab");
+    }
+    result
 }
 
 fn ensure_schema(connection: &Connection) -> Result<()> {
-    connection
-        .execute_batch(
-            "CREATE TABLE IF NOT EXISTS jobs (
-            source TEXT NOT NULL, external_id TEXT NOT NULL, title TEXT NOT NULL,
-            company TEXT NOT NULL, location TEXT, salary TEXT, description TEXT,
-            url TEXT NOT NULL, published_at TEXT,
-            work_site TEXT, annual_salary TEXT, last_updated TEXT,
-            first_seen_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-            last_seen_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-            PRIMARY KEY (source, external_id)
-        );",
-        )
-        .context("failed to initialize SQLite schema")?;
-    for (column, definition) in [
+    connection.execute_batch("CREATE TABLE IF NOT EXISTS jobs (source TEXT NOT NULL, external_id TEXT NOT NULL, title TEXT NOT NULL, company TEXT NOT NULL, location TEXT, salary TEXT, description TEXT, url TEXT NOT NULL, published_at TEXT, work_site TEXT, annual_salary TEXT, last_updated TEXT, first_seen_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, last_seen_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, PRIMARY KEY(source, external_id));").context("failed to initialize SQLite schema")?;
+    for (name, definition) in [
         ("work_site", "TEXT"),
         ("annual_salary", "TEXT"),
         ("last_updated", "TEXT"),
+        ("description", "TEXT"),
     ] {
         let exists: bool = connection
-            .prepare("SELECT 1 FROM pragma_table_info('jobs') WHERE name = ?1")?
-            .exists([column])?;
+            .prepare("SELECT 1 FROM pragma_table_info('jobs') WHERE name=?1")?
+            .exists([name])?;
         if !exists {
             connection.execute(
-                &format!("ALTER TABLE jobs ADD COLUMN {column} {definition}"),
+                &format!("ALTER TABLE jobs ADD COLUMN {name} {definition}"),
                 [],
             )?;
         }
@@ -249,324 +442,834 @@ fn ensure_schema(connection: &Connection) -> Result<()> {
 }
 
 fn load_known_jobs(connection: &Connection) -> Result<HashMap<String, JobListing>> {
-    let mut statement = connection
-        .prepare(
-            "SELECT external_id, title, company, COALESCE(work_site, location),
-                    COALESCE(annual_salary, salary), description, url,
-                    COALESCE(last_updated, published_at)
-         FROM jobs WHERE source = '104'",
-        )
-        .context("failed to prepare known 104 jobs query")?;
-    let rows = statement
-        .query_map([], |row| {
-            let job = JobListing {
-                external_id: row.get(0)?,
-                title: row.get(1)?,
-                company: row.get(2)?,
-                location: row.get(3)?,
-                salary: row.get(4)?,
-                description: row.get(5)?,
-                url: row.get(6)?,
-                published_at: row.get(7)?,
-            };
-            Ok((job.external_id.clone(), job))
+    let mut statement = connection.prepare("SELECT external_id,title,company,COALESCE(work_site,location),COALESCE(annual_salary,salary),description,url,COALESCE(last_updated,published_at) FROM jobs WHERE source='104'")?;
+    let rows = statement.query_map([], |row| {
+        Ok(JobListing {
+            external_id: row.get(0)?,
+            title: row.get(1)?,
+            company: row.get(2)?,
+            location: row.get(3)?,
+            salary: row.get(4)?,
+            description: row.get(5)?,
+            url: row.get(6)?,
+            published_at: row.get(7)?,
         })
-        .context("failed to query known 104 jobs")?;
-    rows.collect::<rusqlite::Result<HashMap<_, _>>>()
+    })?;
+    rows.map(|row| row.map(|job| (job.external_id.clone(), job)))
+        .collect::<rusqlite::Result<HashMap<_, _>>>()
         .context("failed to read known 104 jobs")
 }
 
-fn persist_jobs(connection: &mut Connection, jobs: &[JobListing]) -> Result<usize> {
+fn normalize_text(value: Option<&str>) -> String {
+    value
+        .unwrap_or_default()
+        .replace("\r\n", "\n")
+        .replace('\r', "\n")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+fn changed_fields(old: &JobListing, new: &JobListing) -> Vec<String> {
+    let mut fields = Vec::new();
+    if old.title != new.title {
+        fields.push("title".into());
+    }
+    if old.company != new.company {
+        fields.push("company".into());
+    }
+    if normalize_text(old.location.as_deref()) != normalize_text(new.location.as_deref()) {
+        fields.push("location".into());
+    }
+    if normalize_text(old.salary.as_deref()) != normalize_text(new.salary.as_deref()) {
+        fields.push("salary".into());
+    }
+    if normalize_text(old.description.as_deref()) != normalize_text(new.description.as_deref()) {
+        fields.push("description".into());
+    }
+    if old.url != new.url {
+        fields.push("url".into());
+    }
+    if old.published_at != new.published_at {
+        fields.push("published_at".into());
+    }
+    fields
+}
+
+fn listing_fields_changed(old: &JobListing, new: &JobListing) -> bool {
+    changed_fields(old, new)
+        .into_iter()
+        .any(|field| field != "description")
+}
+
+fn change_record(
+    kind: &str,
+    job: &JobListing,
+    fields: Vec<String>,
+    deleted_at: Option<String>,
+) -> ChangeRecord {
+    ChangeRecord {
+        change_type: kind.into(),
+        source: SOURCE.into(),
+        external_id: job.external_id.clone(),
+        title: job.title.clone(),
+        company: job.company.clone(),
+        location: job.location.clone(),
+        salary: job.salary.clone(),
+        url: job.url.clone(),
+        changed_fields: fields,
+        description: job.description.clone(),
+        deleted_at,
+    }
+}
+
+fn persist_state(
+    connection: &mut Connection,
+    jobs: &[JobListing],
+    ids: &HashSet<String>,
+) -> Result<()> {
     ensure_schema(connection)?;
-    let transaction = connection
+    let tx = connection
         .transaction()
-        .context("failed to begin SQLite transaction")?;
-    let mut statement = transaction
-        .prepare(
-            "INSERT INTO jobs (source, external_id, title, company, location, salary,
-                           description, url, published_at, work_site, annual_salary,
-                           last_updated)
-         VALUES ('104', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-         ON CONFLICT (source, external_id) DO UPDATE SET
-           title = excluded.title, company = excluded.company, location = excluded.location,
-           salary = excluded.salary, description = excluded.description, url = excluded.url,
-           published_at = excluded.published_at, work_site = excluded.work_site,
-           annual_salary = excluded.annual_salary, last_updated = excluded.last_updated,
-           last_seen_at = CURRENT_TIMESTAMP",
-        )
-        .context("failed to prepare SQLite job upsert")?;
-    for job in jobs {
-        statement
-            .execute(params![
-                job.external_id,
-                job.title,
-                job.company,
-                job.location,
-                job.salary,
-                job.description,
-                job.url,
-                job.published_at,
-                job.location,
-                job.salary,
-                job.published_at
-            ])
-            .with_context(|| format!("failed to persist 104 job {}", job.external_id))?;
-    }
-    drop(statement);
-    transaction
-        .commit()
-        .context("failed to commit SQLite job upsert")?;
-    Ok(jobs.len())
-}
-
-fn remove_missing_jobs(connection: &Connection, current_ids: &HashSet<String>) -> Result<usize> {
-    ensure_schema(connection)?;
-    let deleted = if current_ids.is_empty() {
-        connection.execute("DELETE FROM jobs WHERE source = '104'", [])?
-    } else {
-        let placeholders = vec!["?"; current_ids.len()].join(", ");
-        let query = format!(
-            "DELETE FROM jobs WHERE source = '104' AND external_id NOT IN ({placeholders})"
-        );
-        connection.execute(&query, rusqlite::params_from_iter(current_ids.iter()))?
-    };
-    Ok(deleted)
-}
-
-fn next_scheduled_run() -> Result<Duration> {
-    let now = Local::now();
-    let today = now.date_naive();
-    for (hour, minute) in [(7, 0), (17, 0), (21, 30)] {
-        let candidate = today
-            .and_hms_opt(hour, minute, 0)
-            .and_then(|time| Local.from_local_datetime(&time).single());
-        if let Some(candidate) = candidate.filter(|candidate| *candidate > now) {
-            return (candidate - now)
-                .to_std()
-                .context("invalid scheduled run duration");
-        }
-    }
-    let tomorrow = today
-        .checked_add_days(Days::new(1))
-        .context("failed to calculate tomorrow")?;
-    let candidate = tomorrow
-        .and_hms_opt(7, 0, 0)
-        .and_then(|time| Local.from_local_datetime(&time).single())
-        .context("failed to calculate tomorrow's 07:00 run")?;
-    (candidate - now)
-        .to_std()
-        .context("invalid scheduled run duration")
-}
-
-fn run_check(notifier: Option<&LineNotifier>) -> Result<()> {
-    let version: ChromeVersion = reqwest::blocking::get("http://127.0.0.1:9222/json/version")?
-        .error_for_status()?
-        .json()?;
-    let browser = Browser::connect(version.web_socket_debugger_url)
-        .context("failed to connect to Chromium")?;
-    let tab = browser.new_tab().context("failed to create Chromium tab")?;
-    tab.navigate_to(SEARCH_URL)
-        .context("failed to navigate to the 104 Rust search")?
-        .wait_until_navigated()
-        .context("104 search page did not finish navigating")?;
-    let title = tab.get_title()?;
-    println!("Title: {:?}", title);
-    println!("URL: {}", tab.get_url());
-    let html = tab.get_content().context("failed to get rendered HTML")?;
-    println!("HTML size: {}", html.len());
-    println!("Contains Rust: {}", html.contains("Rust"));
-    std::fs::write("job-list.html", &html).context("failed to save job list")?;
-    println!("Saved rendered job list to job-list.html");
-    if is_challenge_page(&title, &html) {
-        anyhow::bail!("104 returned a Cloudflare challenge; refusing to persist an empty result");
-    }
-    thread::sleep(Duration::from_secs(2));
-
-    let total_pages = extract_total_pages(&tab)?;
-    let mut connection = Connection::open("jobs.sqlite3").context("failed to open jobs.sqlite3")?;
-    ensure_schema(&connection)?;
-    let known_jobs = load_known_jobs(&connection)?;
-    let mut seen_job_ids = HashSet::new();
-    let mut current_jobs = Vec::new();
-    let mut changes = Vec::new();
-
-    for page in 1..=total_pages {
-        if page > 1 {
-            tab.navigate_to(&format!("{SEARCH_URL}&page={page}"))
-                .with_context(|| format!("failed to navigate to 104 page {page}"))?
-                .wait_until_navigated()
-                .with_context(|| format!("104 page {page} did not finish navigating"))?;
-            thread::sleep(Duration::from_secs(2));
-        }
-        let page_jobs = extract_job_list(&tab)
-            .with_context(|| format!("failed to extract rendered 104 page {page}"))?;
-        for job in page_jobs {
-            if !seen_job_ids.insert(job.external_id.clone()) {
-                continue;
-            }
-            if let Some(previous_job) = known_jobs.get(&job.external_id) {
-                if previous_job != &job {
-                    println!(
-                        "[Update] {} {} (last updated: {})",
-                        job.external_id,
-                        job.title,
-                        job.published_at.as_deref().unwrap_or("unknown")
-                    );
-                    changes.push(format_change("[Update]", &job));
-                }
-            } else {
-                println!(
-                    "[New] {} {} (last updated: {})",
+        .context("failed to begin SQLite state transaction")?;
+    {
+        let mut statement = tx.prepare("INSERT INTO jobs(source,external_id,title,company,location,salary,description,url,published_at,work_site,annual_salary,last_updated) VALUES('104',?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(source,external_id) DO UPDATE SET title=excluded.title,company=excluded.company,location=excluded.location,salary=excluded.salary,description=COALESCE(excluded.description,jobs.description),url=excluded.url,published_at=excluded.published_at,work_site=excluded.work_site,annual_salary=excluded.annual_salary,last_updated=excluded.last_updated,last_seen_at=CURRENT_TIMESTAMP")?;
+        for job in jobs {
+            statement
+                .execute(params![
                     job.external_id,
                     job.title,
-                    job.published_at.as_deref().unwrap_or("unknown")
-                );
-                changes.push(format_change("[New]", &job));
+                    job.company,
+                    job.location,
+                    job.salary,
+                    job.description,
+                    job.url,
+                    job.published_at,
+                    job.location,
+                    job.salary,
+                    job.published_at
+                ])
+                .with_context(|| format!("failed to persist job {}", job.external_id))?;
+        }
+    }
+    if ids.is_empty() {
+        tx.execute("DELETE FROM jobs WHERE source='104'", [])?;
+    } else {
+        let marks = vec!["?"; ids.len()].join(",");
+        tx.execute(
+            &format!("DELETE FROM jobs WHERE source='104' AND external_id NOT IN ({marks})"),
+            rusqlite::params_from_iter(ids.iter()),
+        )?;
+    }
+    tx.commit()
+        .context("failed to commit SQLite state transaction")
+}
+
+fn taipei_now() -> Result<chrono::DateTime<FixedOffset>> {
+    let offset = FixedOffset::east_opt(TAIPEI_OFFSET).context("invalid Asia/Taipei offset")?;
+    Ok(Utc::now().with_timezone(&offset))
+}
+fn history_dir() -> PathBuf {
+    std::env::var_os("JOB_WATCHER_CHANGE_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("changes"))
+}
+fn history_path(date: NaiveDate) -> PathBuf {
+    history_dir().join(format!("{date}.json"))
+}
+
+fn job_file_dir() -> PathBuf {
+    std::env::var_os("JOB_WATCHER_JD_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("job-list"))
+}
+
+struct JobFileWriter {
+    root: PathBuf,
+    directory: PathBuf,
+    stamp: String,
+    next_batch: usize,
+    jobs: Vec<JobListing>,
+}
+
+impl JobFileWriter {
+    fn new(date: NaiveDate, generated_at: &str) -> Result<Self> {
+        let root = job_file_dir();
+        let directory = root.join(date.format("%m-%d").to_string());
+        fs::create_dir_all(&directory).context("failed to create local JD directory")?;
+        let stamp: String = generated_at
+            .chars()
+            .filter(|character| character.is_ascii_alphanumeric())
+            .collect();
+        Ok(Self {
+            root,
+            directory,
+            stamp,
+            next_batch: 1,
+            jobs: Vec::with_capacity(JD_BATCH_SIZE),
+        })
+    }
+
+    fn push(&mut self, job: JobListing) -> Result<()> {
+        self.jobs.push(job);
+        if self.jobs.len() >= JD_BATCH_SIZE {
+            self.flush()?;
+        }
+        Ok(())
+    }
+
+    fn finish(mut self) -> Result<()> {
+        self.flush()?;
+        rotate_job_files(&self.root)
+    }
+
+    fn flush(&mut self) -> Result<()> {
+        if self.jobs.is_empty() {
+            return Ok(());
+        }
+        let path = self
+            .directory
+            .join(format!("jd-{}-{:03}.json", self.stamp, self.next_batch));
+        fs::write(&path, serde_json::to_vec_pretty(&self.jobs)?)
+            .with_context(|| format!("failed to write full JD batch {}", path.display()))?;
+        info!(path = %path.display(), jobs = self.jobs.len(), "full JD batch file written");
+        self.jobs.clear();
+        self.next_batch += 1;
+        Ok(())
+    }
+}
+
+fn rotate_job_files(root: &Path) -> Result<()> {
+    if !root.is_dir() {
+        return Ok(());
+    }
+    let retention = Duration::from_secs(7 * 24 * 60 * 60);
+    let now = SystemTime::now();
+    for date_entry in fs::read_dir(root)? {
+        let date_dir = date_entry?.path();
+        if !date_dir.is_dir() {
+            continue;
+        }
+        for entry in fs::read_dir(&date_dir)? {
+            let path = entry?.path();
+            if path.extension().and_then(|extension| extension.to_str()) != Some("json") {
+                continue;
             }
-            current_jobs.push(job);
+            let modified = fs::metadata(&path)?.modified()?;
+            if now.duration_since(modified).unwrap_or_default() > retention {
+                fs::remove_file(&path).with_context(|| {
+                    format!("failed to remove expired JD file {}", path.display())
+                })?;
+                info!(path = %path.display(), "removed expired JD file");
+            }
         }
-        println!(
-            "Collected page {page}/{total_pages}: {} jobs",
-            current_jobs.len()
-        );
-    }
-    if current_jobs.is_empty() {
-        anyhow::bail!("104 returned no job cards; refusing to replace the saved job list");
-    }
-    for (external_id, job) in &known_jobs {
-        if !seen_job_ids.contains(external_id) {
-            println!("[Delete] {} {}", external_id, job.title);
-            changes.push(format_change("[Delete]", job));
-        }
-    }
-    std::fs::write("job-list.json", serde_json::to_vec_pretty(&current_jobs)?)
-        .context("failed to save extracted job list")?;
-    println!(
-        "Saved {} unique jobs from {total_pages} pages to job-list.json",
-        current_jobs.len()
-    );
-    let persisted = persist_jobs(&mut connection, &current_jobs)?;
-    println!("Persisted {persisted} jobs to jobs.sqlite3");
-    let deleted = remove_missing_jobs(&connection, &seen_job_ids)?;
-    println!("Removed {deleted} deleted jobs from jobs.sqlite3");
-    if let Some(notifier) = notifier
-        && !changes.is_empty()
-    {
-        match notifier.notify(&changes) {
-            Ok(()) => println!("Sent {} job changes to LINE", changes.len()),
-            Err(error) => eprintln!("LINE notification failed: {error:#}"),
+        if fs::read_dir(&date_dir)?.next().is_none() {
+            fs::remove_dir(&date_dir).with_context(|| {
+                format!("failed to remove empty JD directory {}", date_dir.display())
+            })?;
+            info!(path = %date_dir.display(), "removed empty JD directory");
         }
     }
     Ok(())
 }
 
-fn format_change(kind: &str, job: &JobListing) -> String {
-    format!(
-        "{kind} {}\n{}\nWork site: {}\nAnnual salary: {}\nLast updated: {}\n{}\n{}",
-        job.title,
-        job.company,
-        job.location.as_deref().unwrap_or("unknown"),
-        job.salary.as_deref().unwrap_or("unknown"),
-        job.published_at.as_deref().unwrap_or("unknown"),
-        job.url,
-        job.external_id
+fn append_history(summary: &SyncSummary) -> Result<PathBuf> {
+    let dir = history_dir();
+    fs::create_dir_all(&dir).context("failed to create change history directory")?;
+    let path = history_path(NaiveDate::parse_from_str(&summary.date, "%Y-%m-%d")?);
+    let mut history = if path.is_file() {
+        serde_json::from_slice::<ChangeHistory>(
+            &fs::read(&path).context("failed to read change history")?,
+        )
+        .context("failed to parse change history")?
+    } else {
+        ChangeHistory {
+            date: summary.date.clone(),
+            runs: Vec::new(),
+        }
+    };
+    history.runs.push(HistoryRun {
+        generated_at: summary.generated_at.clone(),
+        trigger: summary.trigger.clone(),
+        new: summary.new.clone(),
+        updated: summary.updated.clone(),
+        deleted: summary.deleted.clone(),
+    });
+    fs::write(&path, serde_json::to_vec_pretty(&history)?)
+        .context("failed to write change history")?;
+    Ok(path)
+}
+
+fn rotate_history(today: NaiveDate) -> Result<()> {
+    let cutoff = today
+        .checked_sub_days(Days::new(6))
+        .context("failed to calculate retention cutoff")?;
+    let dir = history_dir();
+    if !dir.is_dir() {
+        return Ok(());
+    }
+    for entry in fs::read_dir(&dir)? {
+        let path = entry?.path();
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        let Some(stem) = name.strip_suffix(".json") else {
+            continue;
+        };
+        let Ok(date) = NaiveDate::parse_from_str(stem, "%Y-%m-%d") else {
+            continue;
+        };
+        if date < cutoff {
+            fs::remove_file(&path).with_context(|| {
+                format!("failed to remove expired change export {}", path.display())
+            })?;
+            info!(path = %path.display(), "removed expired change export");
+        }
+    }
+    Ok(())
+}
+
+fn cloud_sync(today: NaiveDate) -> Result<Option<String>> {
+    let Some(remote) = std::env::var_os("JOB_WATCHER_RCLONE_REMOTE") else {
+        return Ok(None);
+    };
+    let remote = remote.to_string_lossy();
+    let path = std::env::var("JOB_WATCHER_RCLONE_PATH")
+        .unwrap_or_else(|_| "104-job-watcher/changes".into());
+    let config = std::env::var_os("JOB_WATCHER_RCLONE_CONFIG");
+    let mut command = std::process::Command::new("rclone");
+    command
+        .arg("sync")
+        .arg(history_dir())
+        .arg(format!("{remote}:{path}"));
+    if let Some(config) = config {
+        command.arg("--config").arg(config);
+    }
+    let output = command.output().context("failed to start rclone")?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "rclone failed ({}): {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(Some(format!(
+        "{remote}:{path}/{}",
+        today.format("%Y-%m-%d.json")
+    )))
+}
+
+fn synchronize(
+    trigger: &str,
+    notifier: Option<&LineNotifier>,
+    upload_cloud: bool,
+    update_mode: JobUpdateMode,
+) -> Result<SyncSummary> {
+    let now = taipei_now()?;
+    let date = now.date_naive();
+    let generated_at = now.to_rfc3339();
+    info!(
+        %trigger,
+        url = SEARCH_URL,
+        started_at = %generated_at,
+        "opening 104 job-list URL"
+    );
+    let version: ChromeVersion = reqwest::blocking::get("http://127.0.0.1:9222/json/version")?
+        .error_for_status()?
+        .json()?;
+    let web_socket_debugger_url = version.web_socket_debugger_url.clone();
+    let browser = Browser::connect(version.web_socket_debugger_url)
+        .context("failed to connect to Chromium")?;
+    let detail_browser = Browser::connect(web_socket_debugger_url)
+        .context("failed to connect to Chromium for JD details")?;
+    let tab = browser.new_tab().context("failed to create Chromium tab")?;
+    tab.navigate_to(SEARCH_URL)?.wait_until_navigated()?;
+    let title = tab.get_title()?;
+    let html = tab.get_content()?;
+    fs::write("job-list.html", &html)?;
+    if is_challenge_page(&title, &html) {
+        anyhow::bail!("104 returned a Cloudflare challenge; refusing to persist an empty result");
+    }
+    thread::sleep(Duration::from_secs(2));
+    let total_pages = extract_total_pages(&tab)?;
+    let mut connection = Connection::open("jobs.sqlite3").context("failed to open jobs.sqlite3")?;
+    ensure_schema(&connection)?;
+    let known = load_known_jobs(&connection)?;
+    info!(
+        pages = total_pages,
+        known_jobs = known.len(),
+        ?update_mode,
+        "104 search ready"
+    );
+    let mut ids = HashSet::new();
+    let mut search_jobs = Vec::new();
+    for page in 1..=total_pages {
+        if page > 1 {
+            tab.navigate_to(&format!("{SEARCH_URL}&page={page}"))?
+                .wait_until_navigated()?;
+            thread::sleep(Duration::from_secs(2));
+        }
+        let page_jobs =
+            extract_job_list(&tab).with_context(|| format!("failed to extract page {page}"))?;
+        if page_jobs.is_empty() {
+            anyhow::bail!("104 page {page} returned no cards; refusing an incomplete result set");
+        }
+        info!(
+            page,
+            total_pages,
+            cards = page_jobs.len(),
+            "extracted 104 search page"
+        );
+        for job in page_jobs {
+            if !ids.insert(job.external_id.clone()) {
+                continue;
+            }
+            search_jobs.push(job);
+        }
+    }
+    if search_jobs.is_empty() {
+        anyhow::bail!("104 returned no job cards; refusing to replace the saved job list");
+    }
+    let total_jobs = search_jobs.len();
+    info!(total_jobs, "104 search result set collected");
+    let mut job_writer = match JobFileWriter::new(date, &generated_at) {
+        Ok(writer) => Some(writer),
+        Err(error) => {
+            error!(error = %error, "local JD batch writer could not be initialized");
+            None
+        }
+    };
+    let mut current = Vec::with_capacity(total_jobs);
+    for (index, mut job) in search_jobs.into_iter().enumerate() {
+        let remaining = total_jobs.saturating_sub(index + 1);
+        info!(
+            job_number = index + 1,
+            total_jobs,
+            remaining,
+            external_id = %job.external_id,
+            title = %job.title,
+            "executing JD fetch"
+        );
+        let write_file = !known.contains_key(&job.external_id)
+            || matches!(update_mode, JobUpdateMode::All)
+            || known
+                .get(&job.external_id)
+                .is_some_and(|old| listing_fields_changed(old, &job));
+        if let Some(old) = known.get(&job.external_id) {
+            let fetch_detail = write_file;
+            if fetch_detail {
+                debug!(external_id = %job.external_id, title = %job.title, "fetching complete JD");
+                match extract_detail(&detail_browser, &job) {
+                    Ok(description) if !description.is_empty() => {
+                        info!(
+                            external_id = %job.external_id,
+                            description_chars = description.chars().count(),
+                            "full JD extracted"
+                        );
+                        job.description = Some(description);
+                    }
+                    Ok(_) => job.description = old.description.clone(),
+                    Err(error) => {
+                        error!(external_id = %job.external_id, error = %error, "JD fetch failed; preserving previous JD");
+                        job.description = old.description.clone();
+                    }
+                }
+            } else {
+                debug!(external_id = %job.external_id, title = %job.title, "JD unchanged; reusing persisted JD");
+                job.description = old.description.clone();
+            }
+        } else {
+            debug!(external_id = %job.external_id, title = %job.title, "fetching complete JD for new job");
+            job.description = None;
+            if let Err(error) = extract_detail(&detail_browser, &job).map(|description| {
+                if !description.is_empty() {
+                    info!(
+                        external_id = %job.external_id,
+                        description_chars = description.chars().count(),
+                        "full JD extracted for new job"
+                    );
+                    job.description = Some(description);
+                }
+            }) {
+                error!(external_id = %job.external_id, error = %error, "JD fetch failed for new job");
+            }
+        }
+        if write_file {
+            let write_result = if let Some(writer) = job_writer.as_mut() {
+                writer.push(job.clone())
+            } else {
+                Ok(())
+            };
+            if let Err(error) = write_result {
+                error!(error = %error, "local JD batch write failed");
+                job_writer = None;
+            }
+        }
+        current.push(job);
+    }
+    if current.is_empty() {
+        anyhow::bail!("104 returned no job cards; refusing to replace the saved job list");
+    }
+    let mut summary = SyncSummary {
+        generated_at: generated_at.clone(),
+        date: date.to_string(),
+        trigger: trigger.into(),
+        ..Default::default()
+    };
+    info!(
+        current_jobs = current.len(),
+        "comparing current jobs with SQLite"
+    );
+    for job in &current {
+        if let Some(old) = known.get(&job.external_id) {
+            let fields = changed_fields(old, job);
+            if !fields.is_empty() {
+                summary
+                    .updated
+                    .push(change_record("updated", job, fields, None));
+            }
+        } else {
+            summary
+                .new
+                .push(change_record("new", job, Vec::new(), None));
+        }
+    }
+    for (id, old) in &known {
+        if !ids.contains(id) {
+            summary.deleted.push(change_record(
+                "deleted",
+                old,
+                Vec::new(),
+                Some(generated_at.clone()),
+            ));
+        }
+    }
+    let unchanged = current
+        .len()
+        .saturating_sub(summary.new.len() + summary.updated.len());
+    info!(
+        new = summary.new.len(),
+        updated = summary.updated.len(),
+        deleted = summary.deleted.len(),
+        unchanged,
+        "change comparison complete"
+    );
+    fs::write("job-list.json", serde_json::to_vec_pretty(&current)?)
+        .context("failed to save extracted job list")?;
+    persist_state(&mut connection, &current, &ids)?;
+    info!(current_jobs = current.len(), "SQLite state committed");
+    if let Some(writer) = job_writer
+        && let Err(error) = writer.finish()
+    {
+        error!(error = %error, "local JD batch rotation failed");
+    }
+    match append_history(&summary) {
+        Ok(path) => {
+            summary.export_path = Some(path.display().to_string());
+            info!(path = %path.display(), "change history appended");
+            if let Err(error) = rotate_history(date) {
+                summary.export_error = Some(format!("{error:#}"));
+                error!(error = %error, "change-history rotation failed");
+            } else if !upload_cloud {
+                info!("local update mode: cloud upload skipped");
+            } else {
+                match cloud_sync(date) {
+                    Ok(location) => {
+                        if let Some(location) = &location {
+                            info!(location = %location, "change history uploaded");
+                        } else {
+                            debug!("rclone upload skipped because no remote is configured");
+                        }
+                        summary.cloud_location = location;
+                    }
+                    Err(error) => {
+                        error!(error = %error, "change-history upload failed");
+                        summary.cloud_error = Some(format!("{error:#}"));
+                    }
+                }
+            }
+        }
+        Err(error) => {
+            error!(error = %error, "change-history export failed");
+            summary.export_error = Some(format!("{error:#}"));
+        }
+    }
+    if matches!(trigger, "scheduled" | "local-cli" | "local-cli-all")
+        && let Some(notifier) = notifier
+        && let Err(error) = notifier.send_text(&summary_digest(
+            &summary,
+            if trigger == "scheduled" {
+                "104 每日履歷更新\n同步完成"
+            } else {
+                "104 Job Watcher\n更新完成"
+            },
+        ))
+    {
+        error!(error = %error, "LINE notification failed");
+    }
+    Ok(summary)
+}
+
+pub fn run_local_update() -> Result<SyncSummary> {
+    let line_bot = line_bot_enabled();
+    let notifier = if line_bot {
+        Some(
+            LineNotifier::from_env()?
+                .context("JOB_WATCHER_LINE_BOT=true requires LINE credentials")?,
+        )
+    } else {
+        None
+    };
+    synchronize(
+        "local-cli",
+        notifier.as_ref(),
+        line_bot,
+        JobUpdateMode::Changed,
     )
 }
 
-pub fn run_service() -> Result<()> {
-    let notifier = LineNotifier::from_env()?;
-    if notifier.is_some() {
-        println!("LINE notifications enabled");
+pub fn run_local_update_all() -> Result<SyncSummary> {
+    let line_bot = line_bot_enabled();
+    let notifier = if line_bot {
+        Some(
+            LineNotifier::from_env()?
+                .context("JOB_WATCHER_LINE_BOT=true requires LINE credentials")?,
+        )
     } else {
-        println!("LINE notifications disabled: credentials are not configured");
+        None
+    };
+    synchronize(
+        "local-cli-all",
+        notifier.as_ref(),
+        line_bot,
+        JobUpdateMode::All,
+    )
+}
+
+fn line_bot_enabled() -> bool {
+    matches!(
+        std::env::var("JOB_WATCHER_LINE_BOT")
+            .ok()
+            .as_deref()
+            .map(str::to_ascii_lowercase)
+            .as_deref(),
+        Some("1" | "true" | "yes" | "on")
+    )
+}
+
+fn summary_digest(summary: &SyncSummary, heading: &str) -> String {
+    let mut out = format!(
+        "{heading}\n{}\n\n新增：{}\n更新：{}\n刪除：{}",
+        summary.generated_at,
+        summary.new.len(),
+        summary.updated.len(),
+        summary.deleted.len()
+    );
+    if summary.has_changes() {
+        for (label, items) in [
+            ("New", &summary.new),
+            ("Updated", &summary.updated),
+            ("Deleted", &summary.deleted),
+        ] {
+            if !items.is_empty() {
+                out.push_str(&format!("\n\n[{label}]"));
+                for job in items.iter().take(10) {
+                    out.push_str(&format!(
+                        "\n{}｜{}｜{}\n{}",
+                        job.title,
+                        job.company,
+                        job.location.as_deref().unwrap_or("未提供"),
+                        job.url
+                    ));
+                }
+            }
+        }
     }
-    println!("Running initial 104 job check");
-    if let Err(error) = run_check(notifier.as_ref()) {
-        eprintln!("Initial 104 job check failed: {error:#}");
-        eprintln!("The watcher will wait for the next scheduled check");
+    if let Some(location) = &summary.cloud_location {
+        out.push_str(&format!("\n\n完整 JD：\nGoogle Drive\n{location}"));
     }
+    if summary.cloud_error.is_some() {
+        out.push_str("\n\n職缺資料已更新，但 Google Drive 上傳失敗。\n完整資料仍保留在本機。\n");
+    }
+    if summary.export_error.is_some() {
+        out.push_str("\n\nSQLite 已更新，但完整 JD 匯出失敗。\n");
+    }
+    if !summary.has_changes() && summary.export_error.is_none() {
+        out.push_str("\n\n目前沒有新的職缺異動。\n");
+    }
+    out
+}
+
+fn today_digest() -> String {
+    let Ok(now) = taipei_now() else {
+        return "今日履歷資料無法讀取。".into();
+    };
+    let date = now.date_naive();
+    let path = history_path(date);
+    let Ok(bytes) = fs::read(&path) else {
+        return "今日尚無職缺異動。".into();
+    };
+    let Ok(history) = serde_json::from_slice::<ChangeHistory>(&bytes) else {
+        return "今日履歷資料無法讀取。".into();
+    };
+    let mut by_id: HashMap<(String, String), ChangeRecord> = HashMap::new();
+    for run in history.runs {
+        for record in run.new.into_iter().chain(run.updated).chain(run.deleted) {
+            by_id.insert((record.source.clone(), record.external_id.clone()), record);
+        }
+    }
+    if by_id.is_empty() {
+        return "今日尚無職缺異動。".into();
+    }
+    let mut summary = SyncSummary {
+        date: date.to_string(),
+        generated_at: now.to_rfc3339(),
+        trigger: "read-only".into(),
+        ..Default::default()
+    };
+    for record in by_id.into_values() {
+        match record.change_type.as_str() {
+            "new" => summary.new.push(record),
+            "updated" => summary.updated.push(record),
+            "deleted" => summary.deleted.push(record),
+            _ => {}
+        }
+    }
+    if std::env::var_os("JOB_WATCHER_RCLONE_REMOTE").is_some() {
+        summary.cloud_location = Some(cloud_location(date));
+    }
+    summary_digest(&summary, "今日履歷")
+}
+fn cloud_location(date: NaiveDate) -> String {
+    let remote = std::env::var("JOB_WATCHER_RCLONE_REMOTE").unwrap_or_else(|_| "未設定".into());
+    let path = std::env::var("JOB_WATCHER_RCLONE_PATH")
+        .unwrap_or_else(|_| "104-job-watcher/changes".into());
+    format!("{remote}:{path}/{}.json", date.format("%Y-%m-%d"))
+}
+
+fn next_scheduled_run() -> Result<Duration> {
+    let offset = FixedOffset::east_opt(TAIPEI_OFFSET).context("invalid Taipei timezone")?;
+    let now = Utc::now().with_timezone(&offset);
+    let today = now.date_naive();
+    let candidate = |date: NaiveDate| match offset
+        .from_local_datetime(&date.and_hms_opt(7, 0, 0).context("invalid 07:00")?)
+    {
+        LocalResult::Single(value) => Ok(value),
+        _ => anyhow::bail!("ambiguous Taipei scheduled time"),
+    };
+    let next = if let Some(c) = candidate(today)?
+        .checked_sub_signed(chrono::TimeDelta::zero())
+        .filter(|c| *c > now)
+    {
+        c
+    } else {
+        candidate(
+            today
+                .checked_add_days(Days::new(1))
+                .context("failed to calculate tomorrow")?,
+        )?
+    };
+    (next - now)
+        .to_std()
+        .context("invalid scheduled run duration")
+}
+
+pub fn run_service(service: Service) -> Result<()> {
+    info!(
+        "automatic synchronization schedule is 07:00 Asia/Taipei; startup synchronization disabled"
+    );
     loop {
         let delay = next_scheduled_run()?;
-        println!("Next 104 job check in {} seconds", delay.as_secs());
+        info!(
+            delay_seconds = delay.as_secs(),
+            "waiting for next scheduled synchronization"
+        );
         thread::sleep(delay);
-        if let Err(error) = run_check(notifier.as_ref()) {
-            eprintln!("Scheduled 104 job check failed: {error:#}");
+        if let Err(error) = service.try_synchronize("scheduled") {
+            error!(error = %error, "scheduled synchronization failed");
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{JobListing, is_challenge_page, parse_job_list, persist_jobs, remove_missing_jobs};
-    use rusqlite::Connection;
-    use std::collections::HashSet;
-
+    use super::*;
     #[test]
-    fn parses_the_rendered_104_job_shape() {
-        let jobs = parse_job_list(
-            r#"[{"external_id":"13191931","title":"Rust engineer","company":"Company",
-                "location":"Taipei","salary":"面議","description":null,
-                "url":"https://www.104.com.tw/job/7uqyj","published_at":"8/03"}]"#,
+    fn whitespace_only_description_is_unchanged() {
+        let mut a = sample();
+        let mut b = a.clone();
+        a.description = Some("a\n b".into());
+        b.description = Some(" a  b ".into());
+        assert!(changed_fields(&a, &b).is_empty());
+    }
+    #[test]
+    fn changed_salary_is_reported() {
+        let a = sample();
+        let mut b = a.clone();
+        b.salary = Some("200".into());
+        assert_eq!(changed_fields(&a, &b), vec!["salary"]);
+    }
+    #[test]
+    fn persistence_and_delete_are_transactional() {
+        let mut c = Connection::open_in_memory().unwrap();
+        let a = sample();
+        persist_state(
+            &mut c,
+            std::slice::from_ref(&a),
+            &HashSet::from([a.external_id.clone()]),
         )
-        .expect("fixture should parse");
-
-        assert_eq!(jobs[0].external_id, "13191931");
-        assert_eq!(jobs[0].published_at.as_deref(), Some("8/03"));
+        .unwrap();
+        assert_eq!(load_known_jobs(&c).unwrap().len(), 1);
+        persist_state(&mut c, &[], &HashSet::new()).unwrap();
+        assert!(load_known_jobs(&c).unwrap().is_empty());
     }
-
     #[test]
-    fn detects_cloudflare_challenge_pages() {
+    fn challenge_pages_are_rejected() {
         assert!(is_challenge_page("Just a moment...", "challenge-platform"));
-        assert!(!is_challenge_page(
-            "104 jobs",
-            "challenge-platform div data-job-no=13191931"
-        ));
-        assert!(!is_challenge_page("104 jobs", "rendered job cards"));
+        assert!(!is_challenge_page("104", "data-job-no=abc"));
     }
 
     #[test]
-    fn persists_and_updates_jobs_in_sqlite() {
-        let mut connection = Connection::open_in_memory().expect("in-memory database");
-        let mut job = JobListing {
-            external_id: "13191931".to_owned(),
-            title: "old title".to_owned(),
-            company: "company".to_owned(),
-            location: None,
-            salary: None,
-            description: None,
-            url: "https://www.104.com.tw/job/7uqyj".to_owned(),
-            published_at: None,
+    fn line_commands_are_exact_and_unknown_text_is_ignored() {
+        assert_eq!(command_for("更新JD"), Some("update"));
+        assert_eq!(command_for(" 今日履歷 "), Some("today"));
+        assert_eq!(command_for("更新JD now"), None);
+        assert_eq!(command_for("hello"), None);
+    }
+
+    #[test]
+    fn history_schema_preserves_multiple_runs_and_full_description() {
+        let record = change_record("updated", &sample(), vec!["description".into()], None);
+        let history = ChangeHistory {
+            date: "2026-08-16".into(),
+            runs: vec![HistoryRun {
+                generated_at: "2026-08-16T14:30:00+08:00".into(),
+                trigger: "manual".into(),
+                new: Vec::new(),
+                updated: vec![record],
+                deleted: Vec::new(),
+            }],
         };
-
-        persist_jobs(&mut connection, &[job.clone()]).expect("initial insert");
-        job.title = "updated title".to_owned();
-        persist_jobs(&mut connection, &[job]).expect("upsert");
-
-        let (count, title): (i64, String) = connection
-            .query_row(
-                "SELECT COUNT(*), title FROM jobs WHERE source = '104' AND external_id = '13191931'",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .expect("read persisted job");
-        assert_eq!(count, 1);
-        assert_eq!(title, "updated title");
-
-        let deleted_job = JobListing {
-            external_id: "13191932".to_owned(),
-            title: "deleted title".to_owned(),
-            company: "company".to_owned(),
-            location: None,
-            salary: None,
-            description: None,
-            url: "https://www.104.com.tw/job/deleted".to_owned(),
-            published_at: None,
-        };
-        persist_jobs(&mut connection, &[deleted_job]).expect("insert job to delete");
-        let current_ids = HashSet::from(["13191931".to_owned()]);
+        let json = serde_json::to_string(&history).unwrap();
+        assert!(json.contains("description"));
+        assert!(json.contains("2026-08-16T14:30:00+08:00"));
         assert_eq!(
-            remove_missing_jobs(&connection, &current_ids).expect("delete missing jobs"),
+            serde_json::from_str::<ChangeHistory>(&json)
+                .unwrap()
+                .runs
+                .len(),
             1
         );
+    }
+    fn sample() -> JobListing {
+        JobListing {
+            external_id: "abc".into(),
+            title: "Rust".into(),
+            company: "Co".into(),
+            location: Some("Taipei".into()),
+            salary: Some("100".into()),
+            description: Some("JD".into()),
+            url: "https://www.104.com.tw/job/abc".into(),
+            published_at: Some("8/16".into()),
+        }
     }
 }

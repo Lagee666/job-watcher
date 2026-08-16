@@ -1,257 +1,64 @@
 # Architecture
 
-## Overview
-
-Rust Job Watcher is a long-running service.
-
-It performs one synchronization cycle at startup and then at 07:00, 17:00, and
-21:30 in the machine's local timezone.
-
-The application maintains the schedule internally.
-
-The current implementation is intentionally contained in two source files:
-`main.rs` starts Axum and coordinates the Tokio tasks; `watcher.rs` contains the
-blocking Chromium extraction, scheduler, change comparison, and SQLite writes.
-
-The public HTTP endpoint is a health endpoint only. Job data is acquired by the
-background watcher, not by an Axum request handler.
-
-## Data Flow
+The preserved dependency flow is:
 
 ```text
-In-process scheduler
-      │
-      ▼
-  Application
-      │
-      ▼
-  JobSource
-      │
-      ▼
-External Platform
-      │
-      ▼
-Platform Response
-      │
-      ▼
-Normalization
-      │
-      ▼
-   Extracted job records
-      │
-      ▼
-Compare with SQLite
-      │
-      ├── New
-      ├── Updated
-      ├── Deleted
-      └── Unchanged
-      │
-      ▼
-  SQLite (`jobs.sqlite3`)
-
-New / Updated / Deleted
-      │
-      ▼
-   Log output + LINE notifier
+104 Chromium/CDP → normalized Job → SQLite comparison → SQLite transaction
+                 → daily JSON export → rclone/private Drive → LINE
 ```
 
-## Domain
+`jobs.sqlite3` is the authoritative latest state. `changes/YYYY-MM-DD.json`
+is history/export only and is never used as current state.
 
-The core domain must remain independent from external job platforms.
+## Runtime paths
 
-Example:
+Axum and the in-process scheduler share a `Service`. The scheduler waits for
+the next `07:00 Asia/Taipei` instant; startup does not synchronize. Webhook
+handling recognizes only `更新JD` and `今日履歷`. Browser, SQLite, filesystem,
+rclone, and LINE calls run on blocking threads rather than Tokio executor
+threads.
 
-```rust
-pub struct Job {
-    pub source: JobSourceId,
-    pub external_id: String,
+`更新JD` uses a process-local mutex guard. If another cycle owns it, the caller
+gets `目前正在更新 JD，請稍後再試。`. `今日履歷` does not acquire the guard or
+contact 104.
 
-    pub title: String,
-    pub company: String,
+## Synchronization pipeline
 
-    pub location: Option<String>,
-    pub salary: Option<String>,
-    pub description: String,
+1. Render the search normally in Chromium and reject challenge/incomplete empty
+   results so missing cards cannot become mass deletions.
+2. Extract cards and complete rendered detail text. Detail failures preserve a
+   prior complete description.
+3. Compare `(source, external_id)` and normalized meaningful fields.
+4. Commit all upserts and deletions in one SQLite transaction.
+5. Append a run to today's history JSON.
+6. Retain seven calendar days locally and run scoped `rclone sync`.
+7. Send the scheduled/manual digest. Downstream failures never roll back the
+   committed SQLite state.
 
-    pub url: String,
+A failed history write is reported as an export failure and produces no Drive
+location. A failed rclone invocation leaves local exports intact. LINE failure
+is logged after persistence/export.
 
-    pub published_at: Option<DateTime<Utc>>,
-    pub platform_updated_at: Option<DateTime<Utc>>,
-}
-```
+## One-shot binaries and local JD files
 
-Platform-specific response models must be converted into this representation before entering the rest of the application.
+`update-jobs` runs one local incremental synchronization. It uses the
+recent-first search result as a pre-filter, writes only changed/new full JDs,
+and does not initialize Axum or scheduling. `JOB_WATCHER_LINE_BOT=true` enables
+LINE completion delivery and configured cloud upload; when false, output is
+local files plus tracing logs. Full JDs are stored
+under `JOB_WATCHER_JD_DIR` (default `job-list/`) as timestamped JSON batches
+containing at most 10 jobs per file. Batches are streamed to disk after each
+group of 10 jobs under a date folder such as `08-16/`.
 
-## JobSource
+`update-jobs-all` runs one local full synchronization and refreshes every JD
+batch. Both binaries retain local SQLite, `job-list.json`, `job-list.html`, and
+daily change history. Local JD batch files and empty date folders older than
+seven days are removed.
 
-External platforms are represented through a source abstraction.
+## Domain and comparison
 
-Conceptually:
-
-```rust
-#[async_trait]
-pub trait JobSource {
-    async fn search(
-        &self,
-        query: &JobQuery,
-    ) -> Result<Vec<Job>, JobSourceError>;
-}
-```
-
-Initial implementation:
-
-```text
-JobSource
-    │
-    └── Job104Source
-```
-
-Potential future implementations:
-
-```text
-JobSource
-    ├── Job104Source
-    ├── LinkedInSource
-    ├── YouratorSource
-    └── CakeSource
-```
-
-Adding another source should not require modifying change-detection or persistence logic.
-
-## Change Detection
-
-Jobs are identified by:
-
-```text
-(source, external_id)
-```
-
-Relevant normalized content is hashed.
-
-Conceptually:
-
-```text
-normalize
-    ↓
-canonical representation
-    ↓
-SHA-256
-    ↓
-content_hash
-```
-
-Classification:
-
-```text
-Unknown ID
-    → New
-
-Known ID + different hash
-    → Updated
-
-Known ID + identical hash
-    → Unchanged
-```
-
-Normalization should remove meaningless formatting differences without hiding meaningful content changes.
-
-## Repository
-
-SQLite is the initial persistence mechanism.
-
-The repository owns persistence concerns.
-
-Other modules should not depend directly on SQL queries or SQLite-specific behavior.
-
-Conceptually:
-
-```rust
-trait JobRepository {
-    async fn find(...);
-    async fn insert(...);
-    async fn update(...);
-}
-```
-
-Do not create abstractions merely to support hypothetical databases.
-
-The repository boundary exists primarily to isolate persistence behavior and enable testing.
-
-## Notification
-
-Notification delivery is independent from job sources.
-
-Conceptually:
-
-```rust
-#[async_trait]
-pub trait Notifier {
-    async fn notify(
-        &self,
-        changes: &[JobChange],
-    ) -> Result<(), NotificationError>;
-}
-```
-
-The MVP should implement only one notification channel.
-
-## Scheduling
-
-Scheduling is maintained by the running application.
-
-```text
-In-process scheduler
-      │
-      ├── 07:00
-      ├── 17:00
-      └── 21:30
-             │
-             ▼
-       Synchronization cycle
-             │
-             ▼
-       Sleep until next run
-```
-
-The service performs an immediate check after startup, which also makes manual
-and deployment verification straightforward.
-
-## Failure Strategy
-
-Failures must be visible.
-
-A synchronization cycle should return a non-zero exit status when the overall operation fails.
-
-Failures should include contextual logs.
-
-External-source failures must not corrupt previously stored data.
-
-Notifications should only describe successfully persisted state changes.
-
-## Architectural Principles
-
-Prefer:
-
-* explicit boundaries
-* small modules
-* testable pure logic
-* platform-independent domain models
-* deterministic change detection
-* minimal infrastructure
-
-Avoid:
-
-* speculative abstractions
-* excessive traits
-* unnecessary services
-* premature optimization
-* external-service assumptions leaking into domain code
-
-## Architecture Decision Rule
-
-Before introducing a new architectural abstraction, answer:
-
-> What concrete current problem does this abstraction solve?
-
-If there is no concrete answer, do not introduce it.
+The normalized job contains source identity, title, company, location, salary,
+URL, appearance date, and complete description. 104 selectors and browser
+details stay in `watcher.rs`; history and notification records use normalized
+values. Text comparison normalizes line endings and insignificant whitespace.
+Updated records include deterministic `changed_fields`.

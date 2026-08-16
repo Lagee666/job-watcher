@@ -423,3 +423,27 @@ The watcher writes the raw first-page rendering to `job-list.html` and the
 newly extracted summary records to `job-list.json`. This is a development
 capture path and does not change the warning that the underlying 104 endpoints
 are protected and undocumented.
+
+## Current Chromium detail acquisition
+
+The implementation keeps using the normal Chromium/CDP session. Each listing
+is opened in a separate browser tab and rendered text is read from observed
+description-like containers (`job-description` and class names containing
+`description`), falling back to the rendered body text. These are selector
+observations, not an official 104 API contract. New and existing listings are
+eligible on every low-frequency synchronization because `appearDate` is not a
+verified modification timestamp. A failed detail read is logged by external
+ID and the previous complete description is retained. The source does not call
+the undocumented JSON endpoints directly and does not implement any challenge
+bypass.
+
+Incremental synchronization uses the recent-first search result's meaningful
+listing fields (title, company, location, salary, URL, and appearance date) as
+a detail-fetch pre-filter. If those fields are unchanged, the persisted full JD
+is reused and its JD batch file is not rewritten. `update-jobs-all` intentionally
+skips this pre-filter and refreshes every JD batch file. Each local batch JSON
+contains at most 10 complete JDs and is named with its run timestamp and chunk
+number. Batches are flushed to disk after each group of 10 processed JDs under
+the `MM-DD` date folder. Files older than seven days are removed. This optimization can
+miss a JD-only edit when 104 does not change any listing summary field; use the
+full binary when that stronger check is required.

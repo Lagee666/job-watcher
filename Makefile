@@ -25,3 +25,7 @@ build-rpi:
 
 clean:
 	$(CARGO) clean
+
+chromium:
+	chromium --remote-debugging-port=9222 \
+  	--user-data-dir=/tmp/job-watcher-chromium

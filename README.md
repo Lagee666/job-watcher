@@ -1,220 +1,118 @@
 # Rust Job Watcher
 
-Rust Job Watcher is a small Rust service that monitors public Rust-related job
-listings on 104.com.tw. It renders the normal public search page in Chromium,
-extracts the visible job cards, compares them with a local SQLite database, and
-prints newly created or changed jobs.
+This service renders the public 104 Rust search in Chromium/CDP, compares
+normalized jobs with the authoritative local `jobs.sqlite3`, exports daily
+changes, and sends LINE digests. It does not use undocumented 104 HTTP
+endpoints directly or bypass CAPTCHA, Cloudflare, authentication, or access
+controls.
 
-## What runs
+## Runtime behavior
 
-The executable contains two parts:
+Axum listens on port `3004` by default and accepts `POST /webhook`. Browser,
+SQLite, filesystem, rclone, and LINE work runs off the Tokio executor.
 
-1. An Axum HTTP server listening on port `3004` by default.
-2. A background watcher that performs the 104 synchronization.
+Automatic synchronization runs once daily at `07:00 Asia/Taipei`. Restarting
+the service starts only HTTP and the scheduler; it does not synchronize at
+startup. Automatic `17:00` and `21:30` runs are removed.
 
-The HTTP server provides a simple health response at `/` and accepts LINE
-webhook events at `POST /webhook`. The watcher uses blocking browser, HTTP, and
-SQLite libraries, so it runs in a Tokio blocking task and does not block Axum's
-async runtime.
+LINE commands:
 
-## Check schedule
+- `更新JD` runs one guarded synchronization immediately and returns its digest.
+- `今日履歷` reads today's existing `changes/YYYY-MM-DD.json`; it never opens
+  104. Repeated changes for one `(source, external_id)` are presented once
+  using the latest record.
 
-The watcher:
+Unknown LINE messages are ignored. If no history exists for today, the reply is
+`今日尚無職缺異動。`.
 
-- runs once immediately when the service starts;
-- runs every day at `07:00`, `17:00`, and `21:30`;
-- interprets those times in the machine's local timezone;
-- stays running between checks.
+## Local one-shot update binary
 
-```text
-Start → HTTP server + initial check → scheduled checks at 07:00, 17:00, 21:30
-```
-
-## Change detection
-
-The configured search is:
-
-```text
-https://www.104.com.tw/jobs/search/?jobsource=index_s&keyword=Rust&mode=s&order=16
-```
-
-Every check scans every result page so the complete current result set can be
-compared with SQLite, including deleted jobs.
-
-For every listing encountered:
-
-- `[New]` means its job ID is not in the database;
-- `[Update]` means an existing listing's tracked fields changed;
-- `[Delete]` means a previously saved job is absent from the current result;
-- unchanged listings are silent.
-
-Changed and new listings are upserted into SQLite. A job recreated by 104 with a
-new external ID is therefore reported as `[New]`.
-
-## Quick start
-
-### 1. Install prerequisites
-
-On Debian, Ubuntu, or Raspberry Pi OS:
+Use the separate `update-jobs` binary when LINE and cloud upload must not be
+opened:
 
 ```bash
-sudo apt update
-sudo apt install -y \
-  build-essential pkg-config libssl-dev \
-  chromium \
-  fonts-noto-cjk fonts-noto-cjk-extra fonts-noto-color-emoji
+cargo run --bin update-jobs
 ```
 
-Some distributions call the browser package `chromium-browser` instead of
-`chromium`; install the name provided by that distribution.
+It performs exactly one 104 synchronization, updates local `jobs.sqlite3`,
+`job-list.json`, `job-list.html`, local change history, and only changed
+full-JD batch files under `job-list/` (or `JOB_WATCHER_JD_DIR`). Files are
+written incrementally after every 10 JDs and each batch contains at most 10
+complete JDs. They are placed in a date folder such as `job-list/08-16/`. It uses the
+recent-first list and fetches details for new or potentially changed listings.
 
-Install Rust with [rustup](https://rustup.rs/) if it is not already installed:
+To refresh every full JD file, use:
 
 ```bash
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-source "$HOME/.cargo/env"
+cargo run --bin update-jobs-all
 ```
 
-Check the toolchain:
+Both one-shot binaries exit after one local update and do not initialize the
+Axum server or scheduler. Set `JOB_WATCHER_LINE_BOT=true` to send the completion
+digest through LINE and enable the configured cloud upload; when false, they
+only write local files and tracing logs. JD batch files are named
+`jd-<run>-<chunk>.json` inside the date folder and are removed when their age
+exceeds seven days. The normal `job-watcher` binary
+enables the LINE bot, scheduler, and configured private Drive export.
+
+## Acquisition and state
+
+Search cards provide summary fields. New and known jobs are opened in a second
+normal Chromium tab and the complete visible detail text is extracted. A detail
+failure is logged; a previous valid JD is preserved and empty failed content
+never replaces it. Incremental mode uses recent-first listing fields as a
+pre-filter; `update-jobs-all` is available when every JD must be checked. See
+[docs/104-source.md](docs/104-source.md).
+
+SQLite remains the only current-state store. Its identity is `(source,
+external_id)`, and existing databases are migrated in place. Deterministic
+comparison reports New/Updated/Deleted/Unchanged; textual comparison ignores
+line-ending and insignificant whitespace differences. Updated history includes
+`changed_fields` and the latest complete JD.
+
+## Change exports and Google Drive
+
+Each successful synchronization appends a run to `changes/YYYY-MM-DD.json`.
+The JSON contains `date` and `runs`; each run has `generated_at`, `trigger`, and
+`new`, `updated`, `deleted` arrays. New/updated records contain complete
+normalized data and `description`; deleted records contain identity, summary,
+URL, and deletion timestamp. The current day and previous six calendar days
+are retained. Earlier runs on the same day are never overwritten.
+
+When `JOB_WATCHER_RCLONE_REMOTE` is configured, the service runs:
 
 ```bash
-rustc --version
-cargo --version
-chromium --version
+rclone sync "$JOB_WATCHER_CHANGE_DIR" \
+  "$JOB_WATCHER_RCLONE_REMOTE:$JOB_WATCHER_RCLONE_PATH" \
+  [--config "$JOB_WATCHER_RCLONE_CONFIG"]
 ```
 
-Rust libraries are declared in `Cargo.toml` and downloaded automatically by
-Cargo. The main ones are Axum/Tokio for the service, `headless_chrome` for
-rendering 104, `reqwest` for Chromium's local debugging connection, `rusqlite`
-for SQLite, `serde` for job data, and `chrono` for scheduling.
+Only the configured change directory is synchronized; `jobs.sqlite3` is never
+uploaded. Failed uploads leave local JSON and are reported by LINE. No public
+Drive sharing is enabled; the notification shows the private authenticated
+Drive path. Settings are `JOB_WATCHER_CHANGE_DIR`,
+`JOB_WATCHER_RCLONE_REMOTE`, `JOB_WATCHER_RCLONE_PATH`, and optional
+`JOB_WATCHER_RCLONE_CONFIG`. `JOB_WATCHER_JD_DIR` controls the local full-JD
+batch folder and defaults to `job-list`.
 
-### 2. Start Chromium
-
-The watcher uses Chromium's normal remote-debugging interface to render the
-public 104 page. Start it in a separate terminal:
+## Raspberry Pi / rclone
 
 ```bash
-chromium --remote-debugging-port=9222 \
-  --user-data-dir=/tmp/job-watcher-chromium
+sudo apt install rclone
+rclone config
+rclone lsd gdrive:
 ```
 
-Leave Chromium running while the watcher is running. If the executable is
-called `chromium-browser`, replace the command name.
+Configure a private Google Drive remote. The systemd user must read the same
+rclone config; set `JOB_WATCHER_RCLONE_CONFIG` explicitly because systemd may
+have a different `HOME` than an interactive shell. Do not grant “Anyone with
+the link”. Install Chromium, Rust, and CJK fonts as described in
+[install.md](install.md), then start Chromium with remote debugging on `9222`.
 
-### 3. Run the service
-
-From the repository directory, run the service in another terminal:
-
-```bash
-cargo run
-```
-
-For an optimized build, use `cargo run --release`.
-
-Open `http://127.0.0.1:3004/` or run `curl http://127.0.0.1:3004/` to verify
-that the Axum server is running. Set `JOB_WATCHER_PORT` in `.env` to use a
-different port. The process checks immediately, then remains
-running for the 07:00, 17:00, and 21:30 checks. Stop it with `Ctrl-C`. Full
-installation notes are in [install.md](install.md).
-
-### LINE notifications
-
-To send create/update events to a LINE user, copy the environment template and
-fill in the credentials for your LINE Official Account:
-
-```bash
-cp .env.example .env
-```
-
-Set `LINE_CHANNEL_ACCESS_TOKEN` and `LINE_USER_ID` in `.env`. At startup and at
-each scheduled check, LINE receives the changed job list after SQLite is
-updated. If nothing changed, no LINE message is sent. If the variables are
-absent, the watcher logs events locally and continues without LINE.
-LINE messages contain at most 5 jobs each and at most 4 messages per check. If
-more jobs remain, the fourth message says the jobs are numerous and links to the
-104 search page. Each job message includes the listing's last updated date from
-104.
-
-## Files produced
-
-The service writes these files in its current working directory:
-
-- `jobs.sqlite3` — persistent job state and comparison source;
-- `job-list.json` — records collected during the latest check;
-- `job-list.html` — rendered HTML captured from the first search page.
-
-The SQLite table uses `(source, external_id)` as its primary key. Existing jobs
-are updated with the latest extracted values and `last_seen_at`. Each saved job
-includes `last_updated`, `work_site`, and `annual_salary` (mapped from the 104
-date, location, and salary fields). Existing databases are migrated when the
-service starts.
-
-## Repository map
-
-```text
-src/main.rs       Axum server and Tokio task orchestration
-src/watcher.rs    104 browser extraction, scheduling, comparison, SQLite I/O
-deploy/job-watcher.env.example
-                  Raspberry Pi configuration template for /etc/job-watcher
-docs/architecture.md
-                  Design and runtime data flow
-docs/104-source.md
-                  Verified 104 behavior, selectors, and operational assumptions
-install.md        Local setup and Chromium startup instructions
-AGENT.md          Instructions for contributors and coding agents
-```
-
-## 104 limitations
-
-The watcher uses the publicly rendered page through normal browser rendering.
-104's internal endpoints are undocumented and direct HTTP access may receive a
-Cloudflare challenge. The project does not bypass CAPTCHA, authentication,
-Cloudflare challenges, or other access controls. See
-[docs/104-source.md](docs/104-source.md) before changing the acquisition
-strategy.
-
-## Development checks
-
-The Makefile provides common commands:
-
-```bash
-make build          # optimized build for the current machine
-make build-rpi      # aarch64 Raspberry Pi binary
-make test
-make lint
-```
-
-`make build-rpi` runs `cargo build --release --target
-aarch64-unknown-linux-gnu`. It requires the Rust target and an AArch64 linker
-when building from another architecture.
-
-Run these before submitting changes:
+## Verification
 
 ```bash
 cargo fmt --check
 cargo clippy --offline --locked --all-targets --all-features -- -D warnings
 cargo test --offline --locked --all-features
 ```
-
-The browser-backed integration run also requires Chromium listening on port
-`9222`.
-
-## Current scope
-
-Implemented:
-
-- 104 Rust search extraction through Chromium;
-- virtualized-list scrolling and multi-page collection;
-- SQLite persistence and full-record comparison;
-- create/update logging;
-- startup and three-times-daily scheduling;
-- Axum health endpoint.
-
-Not yet implemented:
-
-- notification channels other than LINE and log output;
-- a separate domain/repository abstraction;
-- deletion history or deletion notifications;
-- support for additional job platforms.
-
-AI coding agents must read `AGENT.md` before modifying this repository.
