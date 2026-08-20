@@ -4,7 +4,7 @@ The preserved dependency flow is:
 
 ```text
 104 Chromium/CDP → normalized Job → SQLite comparison → SQLite transaction
-                 → daily JSON export → rclone/private Drive → LINE
+                 → daily JSON export → rclone/private Drive → LINE/Gmail
 ```
 
 `jobs.sqlite3` is the authoritative latest state. `changes/YYYY-MM-DD.json`
@@ -33,8 +33,10 @@ Drive location without contacting 104.
 4. Commit all upserts and deletions in one SQLite transaction.
 5. Append a run to today's history JSON.
 6. Retain seven calendar days locally and run scoped `rclone sync`.
-7. Send the scheduled/manual digest. Downstream failures never roll back the
-   committed SQLite state.
+7. Send the scheduled/manual digest. When Gmail is configured, the message uses
+   `YYYY/MM/DD JD更新` as its subject, contains only the three change counts,
+   and attaches that day's `YYYY-MM-DD.json` history. Downstream failures never
+   roll back the committed SQLite state.
 
 A failed history write is reported as an export failure and produces no Drive
 location. A failed rclone invocation leaves local exports intact. LINE failure

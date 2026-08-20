@@ -28,4 +28,4 @@ clean:
 
 chromium:
 	chromium --remote-debugging-port=9222 \
-  	--user-data-dir=/tmp/job-watcher-chromium
+	--user-data-dir=/tmp/job-watcher-chromium

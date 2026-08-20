@@ -2,7 +2,7 @@
 
 This service renders the public 104 Rust search in Chromium/CDP, compares
 normalized jobs with the authoritative local `jobs.sqlite3`, exports daily
-changes, and sends LINE digests. It does not use undocumented 104 HTTP
+changes, and sends LINE/Gmail digests. It does not use undocumented 104 HTTP
 endpoints directly or bypass CAPTCHA, Cloudflare, authentication, or access
 controls.
 
@@ -79,6 +79,23 @@ The JSON contains `date` and `runs`; each run has `generated_at`, `trigger`, and
 normalized data and `description`; deleted records contain identity, summary,
 URL, and deletion timestamp. The current day and previous six calendar days
 are retained. Earlier runs on the same day are never overwritten.
+
+When `GMAIL_SMTP_USERNAME`, `GMAIL_SMTP_APP_PASSWORD`, and
+`JOB_WATCHER_EMAIL_TO` are configured,
+each successful synchronization also sends a Gmail message with subject
+`YYYY/MM/DD JD更新`, a body containing only the `新增`, `更新`, and `刪除` counts,
+and the complete daily history attached as `YYYY-MM-DD.json`. The SMTP password
+must be a Gmail app password. Gmail delivery failures are logged and do not
+roll back the synchronization.
+
+To verify SMTP delivery manually without running a synchronization:
+
+```bash
+job-watcher --test-email
+```
+
+This sends the production-formatted test message and does not access 104 or
+modify SQLite or change history.
 
 When `JOB_WATCHER_RCLONE_REMOTE` is configured, the service runs:
 

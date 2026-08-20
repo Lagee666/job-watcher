@@ -26,6 +26,19 @@ async fn main() {
 
 async fn run() -> Result<()> {
     load_environment()?;
+    if std::env::args()
+        .skip(1)
+        .any(|argument| argument == "--test-email")
+    {
+        let reporter = watcher::EmailReporter::from_env()?
+            .context("email test requires GMAIL_SMTP_USERNAME, GMAIL_SMTP_APP_PASSWORD, and JOB_WATCHER_EMAIL_TO")?;
+        let date = watcher::taipei_date()?;
+        reporter
+            .send_test_email(date)
+            .context("manual SMTP email test failed")?;
+        println!("test email sent");
+        return Ok(());
+    }
     let service = watcher::Service::new()?;
     let app = Router::new()
         .route("/", get(|| async { "Rust Job Watcher is running" }))

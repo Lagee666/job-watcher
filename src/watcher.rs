@@ -1,12 +1,16 @@
 use anyhow::{Context, Result};
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use chrono::{Days, FixedOffset, LocalResult, NaiveDate, TimeZone, Utc};
 use headless_chrome::{Browser, browser::tab::Tab};
 use rusqlite::{Connection, params};
+use rustls::{ClientConfig, ClientConnection, RootCertStore, StreamOwned, pki_types::ServerName};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
     collections::{HashMap, HashSet},
     fs,
+    io::{BufRead, BufReader, Write},
+    net::TcpStream,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
     thread,
@@ -100,6 +104,175 @@ impl SyncSummary {
 struct LineNotifier {
     channel_access_token: String,
     user_id: String,
+}
+
+pub struct EmailReporter {
+    username: String,
+    app_password: String,
+    recipient: String,
+}
+
+impl EmailReporter {
+    pub fn from_env() -> Result<Option<Self>> {
+        let username = std::env::var("GMAIL_SMTP_USERNAME").ok();
+        let app_password = std::env::var("GMAIL_SMTP_APP_PASSWORD").ok();
+        let recipient = std::env::var("JOB_WATCHER_EMAIL_TO").ok();
+        match (username, app_password, recipient) {
+            (None, None, None) => Ok(None),
+            (Some(username), Some(app_password), Some(recipient)) => Ok(Some(Self {
+                username,
+                app_password,
+                recipient,
+            })),
+            _ => {
+                anyhow::bail!(
+                    "GMAIL_SMTP_USERNAME, GMAIL_SMTP_APP_PASSWORD, and JOB_WATCHER_EMAIL_TO must be set together"
+                )
+            }
+        }
+    }
+
+    fn send_change_email(&self, summary: &SyncSummary) -> Result<()> {
+        let attachment_path = summary
+            .export_path
+            .as_deref()
+            .context("cannot send Gmail notification without the daily JSON export")?;
+        let attachment = fs::read(attachment_path)
+            .with_context(|| format!("failed to read Gmail attachment {attachment_path}"))?;
+        let date = NaiveDate::parse_from_str(&summary.date, "%Y-%m-%d")?;
+        self.send_message(
+            &date,
+            gmail_subject(summary)?,
+            &gmail_body(summary),
+            &attachment,
+        )
+    }
+
+    pub fn send_test_email(&self, date: NaiveDate) -> Result<()> {
+        let attachment = br#"{"test":true,"source":"job-watcher"}"#;
+        let subject = format!("{} JD更新", date.format("%Y/%m/%d"));
+        self.send_message(&date, subject, "新增：1\n更新：11\n刪除：0", attachment)
+    }
+
+    fn send_message(
+        &self,
+        date: &NaiveDate,
+        subject: String,
+        body: &str,
+        attachment: &[u8],
+    ) -> Result<()> {
+        let filename = format!("{date}.json");
+        let mime = mime_message(&self.recipient, &subject, body, &filename, attachment);
+        let stream = TcpStream::connect(("smtp.gmail.com", 587))
+            .context("failed to connect to smtp.gmail.com:587")?;
+        let mut smtp = SmtpConnection::plain(stream)?;
+        smtp.expect(220, "SMTP greeting")?;
+        smtp.command("EHLO job-watcher", 250)?;
+        smtp.command("STARTTLS", 220)?;
+        let mut roots = RootCertStore::empty();
+        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        let config = ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let server_name =
+            ServerName::try_from("smtp.gmail.com").context("invalid SMTP server name")?;
+        let tls_connection = ClientConnection::new(Arc::new(config), server_name)
+            .context("failed to initialize SMTP TLS")?;
+        let tls_stream = StreamOwned::new(tls_connection, smtp.into_stream());
+        let mut smtp = SmtpConnection::tls(tls_stream)?;
+        smtp.command("EHLO job-watcher", 250)?;
+        smtp.command("AUTH LOGIN", 334)
+            .context("SMTP authentication negotiation failed")?;
+        smtp.command(&STANDARD.encode(self.username.as_bytes()), 334)
+            .context("SMTP username authentication failed")?;
+        smtp.command(&STANDARD.encode(self.app_password.as_bytes()), 235)
+            .context("SMTP authentication failed; verify GMAIL_SMTP_USERNAME and app password")?;
+        smtp.command(&format!("MAIL FROM:<{}>", self.username), 250)?;
+        smtp.command(&format!("RCPT TO:<{}>", self.recipient), 250)?;
+        smtp.command("DATA", 354)?;
+        smtp.write_message(&mime)?;
+        smtp.command("QUIT", 221).context("SMTP delivery failed")?;
+        Ok(())
+    }
+}
+
+enum SmtpConnection {
+    Plain(BufReader<TcpStream>),
+    Tls(Box<BufReader<StreamOwned<ClientConnection, TcpStream>>>),
+}
+
+impl SmtpConnection {
+    fn plain(stream: TcpStream) -> Result<Self> {
+        Ok(Self::Plain(BufReader::with_capacity(1, stream)))
+    }
+    fn tls(stream: StreamOwned<ClientConnection, TcpStream>) -> Result<Self> {
+        Ok(Self::Tls(Box::new(BufReader::with_capacity(1, stream))))
+    }
+    fn into_stream(self) -> TcpStream {
+        match self {
+            Self::Plain(reader) => reader.into_inner(),
+            Self::Tls(_) => unreachable!("STARTTLS is only used on a plain connection"),
+        }
+    }
+    fn response(&mut self) -> Result<(u16, String)> {
+        let reader: &mut dyn BufRead = match self {
+            Self::Plain(reader) => reader,
+            Self::Tls(reader) => reader,
+        };
+        let mut response = String::new();
+        let code = loop {
+            let mut line = String::new();
+            reader
+                .read_line(&mut line)
+                .context("failed to read SMTP response")?;
+            if line.len() < 3 {
+                anyhow::bail!("invalid SMTP response")
+            }
+            let code: u16 = line[..3].parse().context("invalid SMTP response code")?;
+            response.push_str(line.trim_end());
+            if line.as_bytes().get(3) == Some(&b' ') {
+                break code;
+            }
+        };
+        Ok((code, response))
+    }
+    fn expect(&mut self, expected: u16, context: &str) -> Result<()> {
+        let (code, response) = self.response()?;
+        if code != expected {
+            anyhow::bail!("{context} failed with SMTP {code}: {response}")
+        }
+        Ok(())
+    }
+    fn command(&mut self, command: &str, expected: u16) -> Result<()> {
+        self.write_line(command)?;
+        self.expect(expected, command)
+    }
+    fn write_line(&mut self, line: &str) -> Result<()> {
+        match self {
+            Self::Plain(reader) => reader.get_mut().write_all(format!("{line}\r\n").as_bytes()),
+            Self::Tls(reader) => reader.get_mut().write_all(format!("{line}\r\n").as_bytes()),
+        }
+        .context("failed to write SMTP command")
+    }
+    fn write_message(&mut self, message: &str) -> Result<()> {
+        let mut data = String::with_capacity(message.len() + 8);
+        for line in message.split_inclusive('\n') {
+            if line.starts_with('.') {
+                data.push('.');
+            }
+            data.push_str(line);
+        }
+        if !data.ends_with("\r\n") {
+            data.push_str("\r\n");
+        }
+        data.push_str(".\r\n");
+        match self {
+            Self::Plain(reader) => reader.get_mut().write_all(data.as_bytes()),
+            Self::Tls(reader) => reader.get_mut().write_all(data.as_bytes()),
+        }
+        .context("failed to write SMTP message")?;
+        self.expect(250, "SMTP message delivery")
+    }
 }
 
 #[derive(Serialize)]
@@ -575,6 +748,9 @@ fn taipei_now() -> Result<chrono::DateTime<FixedOffset>> {
     let offset = FixedOffset::east_opt(TAIPEI_OFFSET).context("invalid Asia/Taipei offset")?;
     Ok(Utc::now().with_timezone(&offset))
 }
+pub fn taipei_date() -> Result<NaiveDate> {
+    Ok(taipei_now()?.date_naive())
+}
 fn history_dir() -> PathBuf {
     std::env::var_os("JOB_WATCHER_CHANGE_DIR")
         .map(PathBuf::from)
@@ -1005,6 +1181,11 @@ fn synchronize(
             summary.export_error = Some(format!("{error:#}"));
         }
     }
+    if let Some(email) = EmailReporter::from_env()?
+        && let Err(error) = email.send_change_email(&summary)
+    {
+        error!(error = %error, "Gmail notification failed");
+    }
     if matches!(
         trigger,
         "startup" | "scheduled" | "local-cli" | "local-cli-all"
@@ -1111,6 +1292,35 @@ fn summary_digest(summary: &SyncSummary, heading: &str) -> String {
         out.push_str("\n\n目前沒有新的職缺異動。\n");
     }
     out
+}
+
+fn gmail_subject(summary: &SyncSummary) -> Result<String> {
+    let date = NaiveDate::parse_from_str(&summary.date, "%Y-%m-%d")?;
+    Ok(format!("{} JD更新", date.format("%Y/%m/%d")))
+}
+
+fn gmail_body(summary: &SyncSummary) -> String {
+    format!(
+        "新增：{}\n更新：{}\n刪除：{}",
+        summary.new.len(),
+        summary.updated.len(),
+        summary.deleted.len()
+    )
+}
+
+fn mime_message(
+    recipient: &str,
+    subject: &str,
+    body: &str,
+    filename: &str,
+    attachment: &[u8],
+) -> String {
+    let boundary = "job-watcher-attachment";
+    let encoded_subject = format!("=?UTF-8?B?{}?=", STANDARD.encode(subject.as_bytes()));
+    format!(
+        "To: {recipient}\r\nSubject: {encoded_subject}\r\nMIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=\"{boundary}\"\r\n\r\n--{boundary}\r\nContent-Type: text/plain; charset=UTF-8\r\nContent-Transfer-Encoding: 8bit\r\n\r\n{body}\r\n--{boundary}\r\nContent-Type: application/json; name=\"{filename}\"\r\nContent-Disposition: attachment; filename=\"{filename}\"\r\nContent-Transfer-Encoding: base64\r\n\r\n{}\r\n--{boundary}--\r\n",
+        STANDARD.encode(attachment)
+    )
 }
 
 fn today_digest() -> String {
@@ -1260,6 +1470,22 @@ mod tests {
         let mut b = a.clone();
         b.salary = Some("200".into());
         assert_eq!(changed_fields(&a, &b), vec!["salary"]);
+    }
+    #[test]
+    fn gmail_format_uses_taipei_date_and_counts_only() {
+        let summary = SyncSummary {
+            date: "2026-08-19".into(),
+            new: vec![change_record("new", &sample(), Vec::new(), None)],
+            updated: vec![change_record(
+                "updated",
+                &sample(),
+                vec!["salary".into()],
+                None,
+            )],
+            ..Default::default()
+        };
+        assert_eq!(gmail_subject(&summary).unwrap(), "2026/08/19 JD更新");
+        assert_eq!(gmail_body(&summary), "新增：1\n更新：1\n刪除：0");
     }
     #[test]
     fn persistence_and_delete_are_transactional() {
