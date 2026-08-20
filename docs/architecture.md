@@ -4,7 +4,7 @@ The preserved dependency flow is:
 
 ```text
 104 Chromium/CDP → normalized Job → SQLite comparison → SQLite transaction
-                 → daily JSON export → rclone/private Drive → LINE/Gmail
+                 → daily JSON export → Gmail attachment → LINE/Gmail
 ```
 
 `jobs.sqlite3` is the authoritative latest state. `changes/YYYY-MM-DD.json`
@@ -14,14 +14,13 @@ is history/export only and is never used as current state.
 
 Axum and the in-process scheduler share a `Service`. The scheduler waits for
 startup and then the next `06:30 Asia/Taipei` instant. Webhook
-handling recognizes `更新JD`, `今日履歷`, and `url`. Browser, SQLite, filesystem,
-rclone, and LINE calls run on blocking threads rather than Tokio executor
+handling recognizes `更新JD` and `今日履歷`. Browser, SQLite, filesystem,
+SMTP, and LINE calls run on blocking threads rather than Tokio executor
 threads.
 
 `更新JD` uses a process-local mutex guard. If another cycle owns it, the caller
 gets `目前正在更新 JD，請稍後再試。`. `今日履歷` does not acquire the guard or
-contact 104. `url` is also read-only and returns the configured current-day
-Drive location without contacting 104.
+contact 104.
 
 ## Synchronization pipeline
 
@@ -32,23 +31,22 @@ Drive location without contacting 104.
 3. Compare `(source, external_id)` and normalized meaningful fields.
 4. Commit all upserts and deletions in one SQLite transaction.
 5. Append a run to today's history JSON.
-6. Retain seven calendar days locally and run scoped `rclone sync`.
+6. Retain seven calendar days locally.
 7. Send the scheduled/manual digest. When Gmail is configured, the message uses
    `YYYY/MM/DD JD更新` as its subject, contains only the three change counts,
    and attaches that day's `YYYY-MM-DD.json` history. Downstream failures never
    roll back the committed SQLite state.
 
-A failed history write is reported as an export failure and produces no Drive
-location. A failed rclone invocation leaves local exports intact. LINE failure
-is logged after persistence/export.
+A failed history write is reported as an export failure. Gmail and LINE failures
+are logged after persistence/export.
 
 ## One-shot binaries and local JD files
 
 `update-jobs` runs one local incremental synchronization. It uses the
 recent-first search result as a pre-filter, writes only changed/new full JDs,
 and does not initialize Axum or scheduling. `JOB_WATCHER_LINE_BOT=true` enables
-LINE completion delivery and configured cloud upload; when false, output is
-local files plus tracing logs. Full JDs are stored
+LINE completion delivery; when false, output is local files plus tracing logs.
+Gmail delivery is configured independently. Full JDs are stored
 under `JOB_WATCHER_JD_DIR` (default `changes/`) as timestamped JSON batches
 containing at most 10 jobs per file. Batches are streamed to disk after each
 group of 10 jobs under a date folder such as `08-16/`.

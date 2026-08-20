@@ -9,7 +9,7 @@ controls.
 ## Runtime behavior
 
 Axum listens on port `3004` by default and accepts `POST /webhook`. Browser,
-SQLite, filesystem, rclone, and LINE work runs off the Tokio executor.
+SQLite, filesystem, SMTP, and LINE work runs off the Tokio executor.
 
 The service synchronizes once at startup and automatically every day at
 `06:30 Asia/Taipei`. Automatic `17:00` and `21:30` runs are removed.
@@ -20,16 +20,13 @@ LINE commands:
 - `今日履歷` reads today's existing `changes/YYYY-MM-DD.json`; it never opens
   104. Repeated changes for one `(source, external_id)` are presented once
   using the latest record.
-- `url` returns today's configured private Google Drive URL or authenticated
-  rclone path without starting a synchronization.
 
 Unknown LINE messages are ignored. If no history exists for today, the reply is
 `今日尚無職缺異動。`.
 
 ## Local one-shot update binary
 
-Use the separate `update-jobs` binary when LINE and cloud upload must not be
-opened:
+Use the separate `update-jobs` binary for a local one-shot update:
 
 ```bash
 cargo run --bin update-jobs
@@ -50,11 +47,11 @@ cargo run --bin update-jobs-all
 
 Both one-shot binaries exit after one local update and do not initialize the
 Axum server or scheduler. Set `JOB_WATCHER_LINE_BOT=true` to send the completion
-digest through LINE and enable the configured cloud upload; when false, they
-only write local files and tracing logs. JD batch files are named
+digest through LINE; when false, they only write local files and tracing logs.
+Gmail delivery is controlled independently by the Gmail settings below. JD batch files are named
 `jd-<run>-<chunk>.json` inside the date folder and are removed when their age
 exceeds seven days. The normal `job-watcher` binary
-enables the LINE bot, scheduler, and configured private Drive export.
+enables the LINE bot and scheduler.
 
 ## Acquisition and state
 
@@ -71,7 +68,7 @@ comparison reports New/Updated/Deleted/Unchanged; textual comparison ignores
 line-ending and insignificant whitespace differences. Updated history includes
 `changed_fields` and the latest complete JD.
 
-## Change exports and Google Drive
+## Change exports and Gmail
 
 Each successful synchronization appends a run to `changes/YYYY-MM-DD.json`.
 The JSON contains `date` and `runs`; each run has `generated_at`, `trigger`, and
@@ -97,38 +94,12 @@ job-watcher --test-email
 This sends the production-formatted test message and does not access 104 or
 modify SQLite or change history.
 
-When `JOB_WATCHER_RCLONE_REMOTE` is configured, the service runs:
+`JOB_WATCHER_JD_DIR` controls the local full-JD batch folder and defaults to
+`changes`. The daemon uses the same date-folder and 10-JD batch layout as the
+one-shot updater. No Google Drive or other cloud upload is performed.
 
-```bash
-rclone sync "$JOB_WATCHER_CHANGE_DIR" \
-  "$JOB_WATCHER_RCLONE_REMOTE:$JOB_WATCHER_RCLONE_PATH" \
-  [--config "$JOB_WATCHER_RCLONE_CONFIG"]
-```
-
-Only the configured change directory is synchronized; `jobs.sqlite3` is never
-uploaded. Failed uploads leave local JSON and are reported by LINE. No public
-Drive sharing is enabled; the notification shows the private authenticated
-Drive path. Settings are `JOB_WATCHER_CHANGE_DIR`,
-`JOB_WATCHER_RCLONE_REMOTE`, `JOB_WATCHER_RCLONE_PATH`, and optional
-`JOB_WATCHER_RCLONE_CONFIG`. `JOB_WATCHER_DRIVE_URL` may contain a real private
-Google Drive URL for the daily change file; it is never generated as a fake
-public URL. `JOB_WATCHER_JD_DIR` controls the local full-JD batch folder and
-defaults to `changes`. The daemon uses the same date-folder and 10-JD batch
-layout as the one-shot updater.
-
-## Raspberry Pi / rclone
-
-```bash
-sudo apt install rclone
-rclone config
-rclone lsd gdrive:
-```
-
-Configure a private Google Drive remote. The systemd user must read the same
-rclone config; set `JOB_WATCHER_RCLONE_CONFIG` explicitly because systemd may
-have a different `HOME` than an interactive shell. Do not grant “Anyone with
-the link”. Install Chromium, Rust, and CJK fonts as described in
-[install.md](install.md), then start Chromium with remote debugging on `9222`.
+Install Chromium, Rust, and CJK fonts as described in [install.md](install.md),
+then start Chromium with remote debugging on `9222`.
 
 ## Verification
 

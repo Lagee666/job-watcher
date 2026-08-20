@@ -90,9 +90,7 @@ pub struct SyncSummary {
     pub updated: Vec<ChangeRecord>,
     pub deleted: Vec<ChangeRecord>,
     pub export_path: Option<String>,
-    pub cloud_location: Option<String>,
     pub export_error: Option<String>,
-    pub cloud_error: Option<String>,
 }
 
 impl SyncSummary {
@@ -374,7 +372,6 @@ impl Service {
         let result = synchronize(
             trigger,
             self.notifier.as_ref().as_ref(),
-            true,
             JobUpdateMode::Changed,
         );
         match &result {
@@ -435,7 +432,6 @@ pub fn handle_webhook(payload: Value, service: Service) {
         thread::spawn(move || {
             let message = match command {
                 "today" => today_digest(),
-                "url" => drive_url_digest(),
                 _ => {
                     let execute_time = current_execution_time();
                     let started =
@@ -459,7 +455,7 @@ pub fn handle_webhook(payload: Value, service: Service) {
                     }
                 }
             };
-            let result = if matches!(command, "today" | "url") {
+            let result = if command == "today" {
                 if let Some(token) = reply_token.as_deref() {
                     match service.reply_to_line_event(token, &message) {
                         Ok(()) => Ok(()),
@@ -488,7 +484,6 @@ pub fn handle_webhook(payload: Value, service: Service) {
 
 fn command_for(text: &str) -> Option<&'static str> {
     match text.trim() {
-        "url" | "GoogleUrl" => Some("url"),
         "今日履歷" => Some("today"),
         "更新JD" => Some("update"),
         _ => None,
@@ -916,40 +911,9 @@ fn rotate_history(today: NaiveDate) -> Result<()> {
     Ok(())
 }
 
-fn cloud_sync(today: NaiveDate) -> Result<Option<String>> {
-    let Some(remote) = std::env::var_os("JOB_WATCHER_RCLONE_REMOTE") else {
-        return Ok(None);
-    };
-    let remote = remote.to_string_lossy();
-    let path = std::env::var("JOB_WATCHER_RCLONE_PATH")
-        .unwrap_or_else(|_| "104-job-watcher/changes".into());
-    let config = std::env::var_os("JOB_WATCHER_RCLONE_CONFIG");
-    let mut command = std::process::Command::new("rclone");
-    command
-        .arg("sync")
-        .arg(history_dir())
-        .arg(format!("{remote}:{path}"));
-    if let Some(config) = config {
-        command.arg("--config").arg(config);
-    }
-    let output = command.output().context("failed to start rclone")?;
-    if !output.status.success() {
-        anyhow::bail!(
-            "rclone failed ({}): {}",
-            output.status,
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-    }
-    Ok(Some(format!(
-        "{remote}:{path}/{}",
-        today.format("%Y-%m-%d.json")
-    )))
-}
-
 fn synchronize(
     trigger: &str,
     notifier: Option<&LineNotifier>,
-    upload_cloud: bool,
     update_mode: JobUpdateMode,
 ) -> Result<SyncSummary> {
     let now = taipei_now()?;
@@ -1157,23 +1121,6 @@ fn synchronize(
             if let Err(error) = rotate_history(date) {
                 summary.export_error = Some(format!("{error:#}"));
                 error!(error = %error, "change-history rotation failed");
-            } else if !upload_cloud {
-                info!("local update mode: cloud upload skipped");
-            } else {
-                match cloud_sync(date) {
-                    Ok(Some(_remote_location)) => {
-                        let location = cloud_location(date);
-                        info!(location = %location, "change history uploaded");
-                        summary.cloud_location = Some(location);
-                    }
-                    Ok(None) => {
-                        debug!("rclone upload skipped because no remote is configured");
-                    }
-                    Err(error) => {
-                        error!(error = %error, "change-history upload failed");
-                        summary.cloud_error = Some(format!("{error:#}"));
-                    }
-                }
             }
         }
         Err(error) => {
@@ -1214,12 +1161,7 @@ pub fn run_local_update() -> Result<SyncSummary> {
     } else {
         None
     };
-    synchronize(
-        "local-cli",
-        notifier.as_ref(),
-        line_bot,
-        JobUpdateMode::Changed,
-    )
+    synchronize("local-cli", notifier.as_ref(), JobUpdateMode::Changed)
 }
 
 pub fn run_local_update_all() -> Result<SyncSummary> {
@@ -1232,12 +1174,7 @@ pub fn run_local_update_all() -> Result<SyncSummary> {
     } else {
         None
     };
-    synchronize(
-        "local-cli-all",
-        notifier.as_ref(),
-        line_bot,
-        JobUpdateMode::All,
-    )
+    synchronize("local-cli-all", notifier.as_ref(), JobUpdateMode::All)
 }
 
 fn line_bot_enabled() -> bool {
@@ -1278,12 +1215,6 @@ fn summary_digest(summary: &SyncSummary, heading: &str) -> String {
                 }
             }
         }
-    }
-    if let Some(location) = &summary.cloud_location {
-        out.push_str(&format!("\n\n完整 JD：\nGoogle Drive\n{location}"));
-    }
-    if summary.cloud_error.is_some() {
-        out.push_str("\n\n職缺資料已更新，但 Google Drive 上傳失敗。\n完整資料仍保留在本機。\n");
     }
     if summary.export_error.is_some() {
         out.push_str("\n\nSQLite 已更新，但完整 JD 匯出失敗。\n");
@@ -1364,48 +1295,7 @@ fn today_digest() -> String {
             _ => {}
         }
     }
-    if std::env::var_os("JOB_WATCHER_RCLONE_REMOTE").is_some()
-        || std::env::var_os("JOB_WATCHER_DRIVE_URL").is_some()
-    {
-        summary.cloud_location = Some(cloud_location(date));
-    }
     summary_digest(&summary, "今日履歷")
-}
-
-fn drive_url_digest() -> String {
-    let Ok(now) = taipei_now() else {
-        error!("cannot determine Asia/Taipei time while building Drive location");
-        return "Google Drive URL 無法取得。".into();
-    };
-    let has_location = std::env::var_os("JOB_WATCHER_DRIVE_URL").is_some()
-        || std::env::var_os("JOB_WATCHER_RCLONE_REMOTE").is_some();
-    if !has_location {
-        error!(
-            "Drive location requested but JOB_WATCHER_DRIVE_URL and JOB_WATCHER_RCLONE_REMOTE are both unset"
-        );
-        return "Google Drive URL 尚未設定。".into();
-    }
-    let location = cloud_location(now.date_naive());
-    let label = if std::env::var_os("JOB_WATCHER_DRIVE_URL").is_some() {
-        "Google Drive URL"
-    } else {
-        "Google Drive 路徑"
-    };
-    format!("今日完整 JD：\n{label}\n{location}")
-}
-
-fn cloud_location(date: NaiveDate) -> String {
-    if let Ok(base_url) = std::env::var("JOB_WATCHER_DRIVE_URL") {
-        return format!(
-            "{}/{}.json",
-            base_url.trim_end_matches('/'),
-            date.format("%Y-%m-%d")
-        );
-    }
-    let remote = std::env::var("JOB_WATCHER_RCLONE_REMOTE").unwrap_or_else(|_| "未設定".into());
-    let path = std::env::var("JOB_WATCHER_RCLONE_PATH")
-        .unwrap_or_else(|_| "104-job-watcher/changes".into());
-    format!("{remote}:{path}/{}.json", date.format("%Y-%m-%d"))
 }
 
 fn next_scheduled_run() -> Result<Duration> {
@@ -1511,7 +1401,7 @@ mod tests {
     fn line_commands_are_exact_and_unknown_text_is_ignored() {
         assert_eq!(command_for("更新JD"), Some("update"));
         assert_eq!(command_for(" 今日履歷 "), Some("today"));
-        assert_eq!(command_for("url"), Some("url"));
+        assert_eq!(command_for("url"), None);
         assert_eq!(command_for("更新JD now"), None);
         assert_eq!(command_for("hello"), None);
     }

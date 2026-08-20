@@ -16,9 +16,7 @@ fn main() {
 
 fn run() -> Result<()> {
     load_environment()?;
-    info!(
-        "starting local full job update; LINE is controlled by JOB_WATCHER_LINE_BOT and cloud upload follows that setting"
-    );
+    info!("starting local full job update; LINE is controlled by JOB_WATCHER_LINE_BOT");
     let summary = watcher::run_local_update_all()?;
     info!(
         new = summary.new.len(),
