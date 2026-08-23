@@ -3,8 +3,11 @@
 The preserved dependency flow is:
 
 ```text
-104 Chromium/CDP → normalized Job → SQLite comparison → SQLite transaction
-                 → daily JSON export → Gmail attachment → LINE/Gmail
+104 Chromium/CDP ────────┐
+                         │
+LinkedIn Alert ─ Gmail API ─┴→ normalized Job → SQLite comparison
+                                      → SQLite transaction
+                                      → daily JSON export → Gmail attachment → LINE/Gmail
 ```
 
 `jobs.sqlite3` is the authoritative latest state. `changes/YYYY-MM-DD.json`
@@ -13,8 +16,8 @@ is history/export only and is never used as current state.
 ## Runtime paths
 
 Axum and the in-process scheduler share a `Service`. The scheduler waits for
-startup and then the next `06:30 Asia/Taipei` instant. Webhook
-handling recognizes `更新JD` and `今日履歷`. Browser, SQLite, filesystem,
+startup and then the next `07:00 Asia/Taipei` instant. Webhook
+handling recognizes `更新JD` and `今日履歷`. Browser, Gmail API, SQLite, filesystem,
 SMTP, and LINE calls run on blocking threads rather than Tokio executor
 threads.
 
@@ -24,15 +27,17 @@ contact 104.
 
 ## Synchronization pipeline
 
-1. Render the search normally in Chromium and reject challenge/incomplete empty
-   results so missing cards cannot become mass deletions.
-2. Extract cards and complete rendered detail text. Detail failures preserve a
-   prior complete description.
-3. Compare `(source, external_id)` and normalized meaningful fields.
-4. Commit all upserts and deletions in one SQLite transaction.
-5. Append a run to today's history JSON.
-6. Retain seven calendar days locally.
-7. Send the scheduled/manual digest. When Gmail is configured, the message uses
+1. Acquire every enabled source: 104 uses Chromium/CDP; LinkedIn searches Gmail
+   Job Alert messages and fetches public job pages over HTTP.
+2. Reject incomplete or untrusted source snapshots so one provider failure
+   cannot cause mass deletions. LinkedIn deletion comparison is source-scoped.
+3. Normalize both sources into the same Job model and deduplicate LinkedIn
+   results by `(source, external_id)`.
+4. Compare `(source, external_id)` and normalized meaningful fields.
+5. Commit all source upserts and safe deletions in the shared SQLite table.
+6. Append one combined run to today's history JSON.
+7. Retain seven calendar days locally.
+8. Send the scheduled/manual digest. When Gmail is configured, the message uses
    `YYYY/MM/DD JD更新` as its subject, contains only the three change counts,
    and attaches that day's `YYYY-MM-DD.json` history. Downstream failures never
    roll back the committed SQLite state.
@@ -60,6 +65,9 @@ seven days are removed.
 
 The normalized job contains source identity, title, company, location, salary,
 URL, appearance date, and complete description. 104 selectors and browser
-details stay in `watcher.rs`; history and notification records use normalized
-values. Text comparison normalizes line endings and insignificant whitespace.
+details stay in `watcher.rs`. Gmail/MIME parsing and LinkedIn normalization stay
+in `source/` and do not leak into the domain, repository, or
+notification code. Both sources use the same `(source, external_id)` SQLite
+identity, combined change history, Gmail attachment, and LINE reporting. Text
+comparison normalizes line endings and insignificant whitespace.
 Updated records include deterministic `changed_fields`.

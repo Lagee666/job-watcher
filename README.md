@@ -1,8 +1,9 @@
 # Rust Job Watcher
 
-This service renders the public 104 Rust search in Chromium/CDP, compares
-normalized jobs with the authoritative local `jobs.sqlite3`, exports daily
-changes, and sends LINE/Gmail digests. It does not use undocumented 104 HTTP
+This service renders the public 104 Rust search in Chromium/CDP and optionally
+acquires LinkedIn jobs from Gmail Job Alert messages, compares normalized jobs with the
+authoritative local `jobs.sqlite3`, exports daily changes, and sends LINE/Gmail
+digests. It does not use undocumented 104 HTTP
 endpoints directly or bypass CAPTCHA, Cloudflare, authentication, or access
 controls.
 
@@ -11,8 +12,8 @@ controls.
 Axum listens on port `3004` by default and accepts `POST /webhook`. Browser,
 SQLite, filesystem, SMTP, and LINE work runs off the Tokio executor.
 
-The service synchronizes once at startup and automatically every day at
-`06:30 Asia/Taipei`. Automatic `17:00` and `21:30` runs are removed.
+The service synchronizes all enabled sources once at startup and automatically every day at
+`07:00 Asia/Taipei`. Automatic `17:00` and `21:30` runs are removed.
 
 LINE commands:
 
@@ -32,7 +33,7 @@ Use the separate `update-jobs` binary for a local one-shot update:
 cargo run --bin update-jobs
 ```
 
-It performs exactly one 104 synchronization, updates local `jobs.sqlite3`,
+It performs exactly one synchronization of all enabled sources, updates local `jobs.sqlite3`,
 `job-list.json`, `job-list.html`, local change history, and only changed
 full-JD batch files under `changes/` (or `JOB_WATCHER_JD_DIR`). Files are
 written incrementally after every 10 JDs and each batch contains at most 10
@@ -54,6 +55,14 @@ exceeds seven days. The normal `job-watcher` binary
 enables the LINE bot and scheduler.
 
 ## Acquisition and state
+
+104 remains a rendered Chromium/CDP source. LinkedIn is optional and uses the
+Gmail API to read Job Alert messages, then fetches public LinkedIn pages without
+login cookies or browser sessions. See
+[docs/linkedin-source.md](docs/linkedin-source.md) for OAuth setup, alert
+parsing, public-page mapping, and failure safety. Set `LINKEDIN_ENABLED=true`,
+provide `GMAIL_OAUTH_CLIENT_FILE` and `GMAIL_OAUTH_TOKEN_FILE`, and configure
+`LINKEDIN_GMAIL_QUERY` if the default search is not suitable.
 
 Search cards provide summary fields. New and known jobs are opened in a second
 normal Chromium tab and the complete visible detail text is extracted. A detail
@@ -93,6 +102,13 @@ job-watcher --test-email
 
 This sends the production-formatted test message and does not access 104 or
 modify SQLite or change history.
+
+To inspect LinkedIn Job Alert URLs from Gmail without fetching LinkedIn pages
+or modifying SQLite/history:
+
+```bash
+cargo run --bin search-linkedin-alerts
+```
 
 `JOB_WATCHER_JD_DIR` controls the local full-JD batch folder and defaults to
 `changes`. The daemon uses the same date-folder and 10-JD batch layout as the

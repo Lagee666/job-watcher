@@ -10,6 +10,7 @@ use serde_json::Value;
 use std::net::SocketAddr;
 use tokio::task::spawn_blocking;
 use tracing::{Level, error, info};
+use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
 async fn main() {
@@ -17,6 +18,9 @@ async fn main() {
         .with_max_level(Level::DEBUG)
         .with_target(true)
         .with_line_number(true)
+        .with_env_filter(EnvFilter::new(
+            "debug,headless_chrome::browser::tab=off,h2::codec=off,hyper_util::client::=off,yup_oauth2=off",
+        ))
         .init();
     if let Err(error) = run().await {
         error!(error = %error, "Job Watcher terminated with an error");

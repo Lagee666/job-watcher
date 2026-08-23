@@ -1,3 +1,4 @@
+use crate::source::{JobSource, SourceSnapshot, linkedin::LinkedInAlertSource};
 use anyhow::{Context, Result};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use chrono::{Days, FixedOffset, LocalResult, NaiveDate, TimeZone, Utc};
@@ -38,6 +39,8 @@ struct ChromeVersion {
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct JobListing {
+    #[serde(default = "default_source")]
+    pub source: String,
     pub external_id: String,
     pub title: String,
     pub company: String,
@@ -46,6 +49,17 @@ pub struct JobListing {
     pub description: Option<String>,
     pub url: String,
     pub published_at: Option<String>,
+    pub platform_updated_at: Option<String>,
+    #[serde(default = "default_fetch_state")]
+    pub fetch_state: String,
+}
+
+fn default_source() -> String {
+    SOURCE.into()
+}
+
+fn default_fetch_state() -> String {
+    "Complete".into()
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -58,6 +72,8 @@ pub struct ChangeRecord {
     pub location: Option<String>,
     pub salary: Option<String>,
     pub url: String,
+    #[serde(default = "default_fetch_state")]
+    pub fetch_state: String,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub changed_fields: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -596,12 +612,14 @@ fn extract_detail(browser: &Browser, job: &JobListing) -> Result<String> {
 }
 
 fn ensure_schema(connection: &Connection) -> Result<()> {
-    connection.execute_batch("CREATE TABLE IF NOT EXISTS jobs (source TEXT NOT NULL, external_id TEXT NOT NULL, title TEXT NOT NULL, company TEXT NOT NULL, location TEXT, salary TEXT, description TEXT, url TEXT NOT NULL, published_at TEXT, work_site TEXT, annual_salary TEXT, last_updated TEXT, first_seen_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, last_seen_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, PRIMARY KEY(source, external_id));").context("failed to initialize SQLite schema")?;
+    connection.execute_batch("CREATE TABLE IF NOT EXISTS jobs (source TEXT NOT NULL, external_id TEXT NOT NULL, title TEXT NOT NULL, company TEXT NOT NULL, location TEXT, salary TEXT, description TEXT, url TEXT NOT NULL, published_at TEXT, platform_updated_at TEXT, fetch_state TEXT NOT NULL DEFAULT 'Complete', work_site TEXT, annual_salary TEXT, last_updated TEXT, first_seen_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, last_seen_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, PRIMARY KEY(source, external_id));").context("failed to initialize SQLite schema")?;
     for (name, definition) in [
         ("work_site", "TEXT"),
         ("annual_salary", "TEXT"),
         ("last_updated", "TEXT"),
         ("description", "TEXT"),
+        ("platform_updated_at", "TEXT"),
+        ("fetch_state", "TEXT NOT NULL DEFAULT 'Complete'"),
     ] {
         let exists: bool = connection
             .prepare("SELECT 1 FROM pragma_table_info('jobs') WHERE name=?1")?
@@ -617,22 +635,47 @@ fn ensure_schema(connection: &Connection) -> Result<()> {
 }
 
 fn load_known_jobs(connection: &Connection) -> Result<HashMap<String, JobListing>> {
-    let mut statement = connection.prepare("SELECT external_id,title,company,COALESCE(work_site,location),COALESCE(annual_salary,salary),description,url,COALESCE(last_updated,published_at) FROM jobs WHERE source='104'")?;
+    let mut statement = connection.prepare("SELECT source,external_id,title,company,COALESCE(work_site,location),COALESCE(annual_salary,salary),description,url,published_at,platform_updated_at,fetch_state FROM jobs WHERE source='104'")?;
     let rows = statement.query_map([], |row| {
         Ok(JobListing {
-            external_id: row.get(0)?,
-            title: row.get(1)?,
-            company: row.get(2)?,
-            location: row.get(3)?,
-            salary: row.get(4)?,
-            description: row.get(5)?,
-            url: row.get(6)?,
-            published_at: row.get(7)?,
+            source: row.get(0)?,
+            external_id: row.get(1)?,
+            title: row.get(2)?,
+            company: row.get(3)?,
+            location: row.get(4)?,
+            salary: row.get(5)?,
+            description: row.get(6)?,
+            url: row.get(7)?,
+            published_at: row.get(8)?,
+            platform_updated_at: row.get(9)?,
+            fetch_state: row.get(10)?,
         })
     })?;
     rows.map(|row| row.map(|job| (job.external_id.clone(), job)))
         .collect::<rusqlite::Result<HashMap<_, _>>>()
         .context("failed to read known 104 jobs")
+}
+
+fn load_all_known_jobs(connection: &Connection) -> Result<HashMap<(String, String), JobListing>> {
+    let mut statement = connection.prepare("SELECT source,external_id,title,company,COALESCE(work_site,location),COALESCE(annual_salary,salary),description,url,published_at,platform_updated_at,fetch_state FROM jobs")?;
+    let rows = statement.query_map([], |row| {
+        Ok(JobListing {
+            source: row.get(0)?,
+            external_id: row.get(1)?,
+            title: row.get(2)?,
+            company: row.get(3)?,
+            location: row.get(4)?,
+            salary: row.get(5)?,
+            description: row.get(6)?,
+            url: row.get(7)?,
+            published_at: row.get(8)?,
+            platform_updated_at: row.get(9)?,
+            fetch_state: row.get(10)?,
+        })
+    })?;
+    rows.map(|row| row.map(|job| ((job.source.clone(), job.external_id.clone()), job)))
+        .collect::<rusqlite::Result<HashMap<_, _>>>()
+        .context("failed to read known jobs")
 }
 
 fn normalize_text(value: Option<&str>) -> String {
@@ -667,6 +710,12 @@ fn changed_fields(old: &JobListing, new: &JobListing) -> Vec<String> {
     if old.published_at != new.published_at {
         fields.push("published_at".into());
     }
+    if old.platform_updated_at != new.platform_updated_at {
+        fields.push("platform_updated_at".into());
+    }
+    if old.fetch_state != new.fetch_state {
+        fields.push("fetch_state".into());
+    }
     fields
 }
 
@@ -684,13 +733,14 @@ fn change_record(
 ) -> ChangeRecord {
     ChangeRecord {
         change_type: kind.into(),
-        source: SOURCE.into(),
+        source: job.source.clone(),
         external_id: job.external_id.clone(),
         title: job.title.clone(),
         company: job.company.clone(),
         location: job.location.clone(),
         salary: job.salary.clone(),
         url: job.url.clone(),
+        fetch_state: job.fetch_state.clone(),
         changed_fields: fields,
         description: job.description.clone(),
         deleted_at,
@@ -699,18 +749,21 @@ fn change_record(
 
 fn persist_state(
     connection: &mut Connection,
+    source: &str,
     jobs: &[JobListing],
     ids: &HashSet<String>,
+    allow_deletions: bool,
 ) -> Result<()> {
     ensure_schema(connection)?;
     let tx = connection
         .transaction()
         .context("failed to begin SQLite state transaction")?;
     {
-        let mut statement = tx.prepare("INSERT INTO jobs(source,external_id,title,company,location,salary,description,url,published_at,work_site,annual_salary,last_updated) VALUES('104',?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(source,external_id) DO UPDATE SET title=excluded.title,company=excluded.company,location=excluded.location,salary=excluded.salary,description=COALESCE(excluded.description,jobs.description),url=excluded.url,published_at=excluded.published_at,work_site=excluded.work_site,annual_salary=excluded.annual_salary,last_updated=excluded.last_updated,last_seen_at=CURRENT_TIMESTAMP")?;
+        let mut statement = tx.prepare("INSERT INTO jobs(source,external_id,title,company,location,salary,description,url,published_at,platform_updated_at,fetch_state,work_site,annual_salary,last_updated) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?5,?6,COALESCE(?10,?9)) ON CONFLICT(source,external_id) DO UPDATE SET title=excluded.title,company=excluded.company,location=excluded.location,salary=excluded.salary,description=COALESCE(excluded.description,jobs.description),url=excluded.url,published_at=excluded.published_at,platform_updated_at=excluded.platform_updated_at,fetch_state=excluded.fetch_state,work_site=excluded.work_site,annual_salary=excluded.annual_salary,last_updated=excluded.last_updated,last_seen_at=CURRENT_TIMESTAMP")?;
         for job in jobs {
             statement
                 .execute(params![
+                    source,
                     job.external_id,
                     job.title,
                     job.company,
@@ -719,20 +772,26 @@ fn persist_state(
                     job.description,
                     job.url,
                     job.published_at,
-                    job.location,
-                    job.salary,
-                    job.published_at
+                    job.platform_updated_at,
+                    job.fetch_state
                 ])
                 .with_context(|| format!("failed to persist job {}", job.external_id))?;
         }
     }
+    if !allow_deletions {
+        return tx
+            .commit()
+            .context("failed to commit SQLite state transaction");
+    }
     if ids.is_empty() {
-        tx.execute("DELETE FROM jobs WHERE source='104'", [])?;
+        tx.execute("DELETE FROM jobs WHERE source=?", [source])?;
     } else {
         let marks = vec!["?"; ids.len()].join(",");
         tx.execute(
-            &format!("DELETE FROM jobs WHERE source='104' AND external_id NOT IN ({marks})"),
-            rusqlite::params_from_iter(ids.iter()),
+            &format!("DELETE FROM jobs WHERE source=? AND external_id NOT IN ({marks})"),
+            rusqlite::params_from_iter(
+                std::iter::once(source).chain(ids.iter().map(String::as_str)),
+            ),
         )?;
     }
     tx.commit()
@@ -916,6 +975,128 @@ fn synchronize(
     notifier: Option<&LineNotifier>,
     update_mode: JobUpdateMode,
 ) -> Result<SyncSummary> {
+    match synchronize_104_and_linkedin(trigger, notifier, update_mode) {
+        Ok(summary) => Ok(summary),
+        Err(error) => {
+            let Ok(Some(linkedin)) = LinkedInAlertSource::from_env() else {
+                return Err(error);
+            };
+            let snapshot = match linkedin.acquire() {
+                Ok(snapshot) => snapshot,
+                Err(linkedin_error) => {
+                    error!(
+                        error = %linkedin_error,
+                        original_error = %error,
+                        "104 and LinkedIn synchronization failed"
+                    );
+                    return Err(error);
+                }
+            };
+            info!(error = %error, "104 synchronization failed; continuing with LinkedIn snapshot");
+            synchronize_linkedin_only(trigger, notifier, snapshot)
+        }
+    }
+}
+
+fn synchronize_linkedin_only(
+    trigger: &str,
+    notifier: Option<&LineNotifier>,
+    snapshot: SourceSnapshot,
+) -> Result<SyncSummary> {
+    let now = taipei_now()?;
+    let generated_at = now.to_rfc3339();
+    let mut connection = Connection::open("jobs.sqlite3").context("failed to open jobs.sqlite3")?;
+    ensure_schema(&connection)?;
+    let known = load_all_known_jobs(&connection)?;
+    let mut summary = SyncSummary {
+        generated_at: generated_at.clone(),
+        date: now.date_naive().to_string(),
+        trigger: trigger.into(),
+        ..Default::default()
+    };
+    let ids = merge_snapshot(&mut summary, &snapshot, &known, &generated_at);
+    persist_state(
+        &mut connection,
+        &snapshot.source,
+        &snapshot.jobs,
+        &ids,
+        snapshot.allow_deletions,
+    )?;
+    finish_summary(summary, notifier)
+}
+
+fn merge_snapshot(
+    summary: &mut SyncSummary,
+    snapshot: &SourceSnapshot,
+    known: &HashMap<(String, String), JobListing>,
+    generated_at: &str,
+) -> HashSet<String> {
+    let mut ids = HashSet::new();
+    for job in &snapshot.jobs {
+        ids.insert(job.external_id.clone());
+        let key = (snapshot.source.clone(), job.external_id.clone());
+        if let Some(old) = known.get(&key) {
+            let fields = changed_fields(old, job);
+            if !fields.is_empty() {
+                summary
+                    .updated
+                    .push(change_record("updated", job, fields, None));
+            }
+        } else {
+            summary
+                .new
+                .push(change_record("new", job, Vec::new(), None));
+        }
+    }
+    for ((source, id), old) in known {
+        if snapshot.allow_deletions && source == &snapshot.source && !ids.contains(id) {
+            summary.deleted.push(change_record(
+                "deleted",
+                old,
+                Vec::new(),
+                Some(generated_at.to_owned()),
+            ));
+        }
+    }
+    ids
+}
+
+fn finish_summary(
+    mut summary: SyncSummary,
+    notifier: Option<&LineNotifier>,
+) -> Result<SyncSummary> {
+    let date = NaiveDate::parse_from_str(&summary.date, "%Y-%m-%d")?;
+    match append_history(&summary) {
+        Ok(path) => {
+            summary.export_path = Some(path.display().to_string());
+            if let Err(error) = rotate_history(date) {
+                summary.export_error = Some(format!("{error:#}"));
+                error!(error = %error, "change-history rotation failed");
+            }
+        }
+        Err(error) => {
+            summary.export_error = Some(format!("{error:#}"));
+            error!(error = %error, "change-history export failed");
+        }
+    }
+    if let Some(email) = EmailReporter::from_env()?
+        && let Err(error) = email.send_change_email(&summary)
+    {
+        error!(error = %error, "Gmail notification failed");
+    }
+    if let Some(notifier) = notifier
+        && let Err(error) = notifier.send_text(&summary_digest(&summary, "Job Watcher\n更新完成"))
+    {
+        error!(error = %error, "LINE notification failed");
+    }
+    Ok(summary)
+}
+
+fn synchronize_104_and_linkedin(
+    trigger: &str,
+    notifier: Option<&LineNotifier>,
+    update_mode: JobUpdateMode,
+) -> Result<SyncSummary> {
     let now = taipei_now()?;
     let date = now.date_naive();
     let generated_at = now.to_rfc3339();
@@ -931,6 +1112,7 @@ fn synchronize(
     let web_socket_debugger_url = version.web_socket_debugger_url.clone();
     let browser = Browser::connect(version.web_socket_debugger_url)
         .context("failed to connect to Chromium")?;
+
     let detail_browser = Browser::connect(web_socket_debugger_url)
         .context("failed to connect to Chromium for JD details")?;
     let tab = browser.new_tab().context("failed to create Chromium tab")?;
@@ -1095,6 +1277,34 @@ fn synchronize(
             ));
         }
     }
+    match LinkedInAlertSource::from_env() {
+        Ok(Some(linkedin)) => match linkedin.acquire() {
+            Ok(snapshot) => {
+                let known_all = load_all_known_jobs(&connection)?;
+                let mut linkedin_summary = summary.clone();
+                let linkedin_ids =
+                    merge_snapshot(&mut linkedin_summary, &snapshot, &known_all, &generated_at);
+                if let Err(error) = persist_state(
+                    &mut connection,
+                    linkedin.source_name(),
+                    &snapshot.jobs,
+                    &linkedin_ids,
+                    snapshot.allow_deletions,
+                ) {
+                    error!(error = %error, "LinkedIn state persistence failed; preserving previous LinkedIn state");
+                } else {
+                    summary = linkedin_summary;
+                }
+            }
+            Err(error) => {
+                error!(error = %error, "LinkedIn acquisition failed; preserving existing LinkedIn jobs");
+            }
+        },
+        Ok(None) => {}
+        Err(error) => {
+            error!(error = %error, "LinkedIn configuration invalid; preserving existing LinkedIn jobs");
+        }
+    }
     let unchanged = current
         .len()
         .saturating_sub(summary.new.len() + summary.updated.len());
@@ -1107,7 +1317,7 @@ fn synchronize(
     );
     fs::write("job-list.json", serde_json::to_vec_pretty(&current)?)
         .context("failed to save extracted job list")?;
-    persist_state(&mut connection, &current, &ids)?;
+    persist_state(&mut connection, SOURCE, &current, &ids, true)?;
     info!(current_jobs = current.len(), "SQLite state committed");
     if let Some(writer) = job_writer
         && let Err(error) = writer.finish()
@@ -1140,9 +1350,9 @@ fn synchronize(
         && let Err(error) = notifier.send_text(&summary_digest(
             &summary,
             match trigger {
-                "scheduled" => "104 每日履歷更新\n同步完成",
-                "startup" => "104 Job Watcher\n啟動更新完成",
-                _ => "104 Job Watcher\n更新完成",
+                "scheduled" => "每日履歷更新\n同步完成",
+                "startup" => "Job Watcher\n啟動更新完成",
+                _ => "Job Watcher\n更新完成",
             },
         ))
     {
@@ -1303,7 +1513,7 @@ fn next_scheduled_run() -> Result<Duration> {
     let now = Utc::now().with_timezone(&offset);
     let today = now.date_naive();
     let candidate = |date: NaiveDate| match offset
-        .from_local_datetime(&date.and_hms_opt(6, 30, 0).context("invalid 06:30")?)
+        .from_local_datetime(&date.and_hms_opt(7, 0, 0).context("invalid 07:00")?)
     {
         LocalResult::Single(value) => Ok(value),
         _ => anyhow::bail!("ambiguous Taipei scheduled time"),
@@ -1326,7 +1536,7 @@ fn next_scheduled_run() -> Result<Duration> {
 }
 
 pub fn run_service(service: Service) -> Result<()> {
-    info!("running startup synchronization; automatic schedule is 06:30 Asia/Taipei");
+    info!("running startup synchronization; automatic schedule is 07:00 Asia/Taipei");
     if let Err(error) = service.try_synchronize("startup") {
         error!(error = %error, "startup synchronization failed");
     }
@@ -1383,13 +1593,27 @@ mod tests {
         let a = sample();
         persist_state(
             &mut c,
+            SOURCE,
             std::slice::from_ref(&a),
             &HashSet::from([a.external_id.clone()]),
+            true,
         )
         .unwrap();
         assert_eq!(load_known_jobs(&c).unwrap().len(), 1);
-        persist_state(&mut c, &[], &HashSet::new()).unwrap();
+        let mut linkedin = a.clone();
+        linkedin.source = "linkedin".into();
+        persist_state(
+            &mut c,
+            "linkedin",
+            std::slice::from_ref(&linkedin),
+            &HashSet::from([linkedin.external_id.clone()]),
+            false,
+        )
+        .unwrap();
+        assert_eq!(load_all_known_jobs(&c).unwrap().len(), 2);
+        persist_state(&mut c, SOURCE, &[], &HashSet::new(), true).unwrap();
         assert!(load_known_jobs(&c).unwrap().is_empty());
+        assert_eq!(load_all_known_jobs(&c).unwrap().len(), 1);
     }
     #[test]
     fn challenge_pages_are_rejected() {
@@ -1432,6 +1656,7 @@ mod tests {
     }
     fn sample() -> JobListing {
         JobListing {
+            source: SOURCE.into(),
             external_id: "abc".into(),
             title: "Rust".into(),
             company: "Co".into(),
@@ -1440,6 +1665,8 @@ mod tests {
             description: Some("JD".into()),
             url: "https://www.104.com.tw/job/abc".into(),
             published_at: Some("8/16".into()),
+            platform_updated_at: None,
+            fetch_state: "Complete".into(),
         }
     }
 }

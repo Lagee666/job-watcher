@@ -1,9 +1,15 @@
+pub mod source;
 pub mod watcher;
 
 use anyhow::{Context, Result};
 use std::path::Path;
 
 pub fn load_environment() -> Result<()> {
+    // Several dependencies enable different Rustls crypto backends. Select one
+    // before any HTTP client can initialize Rustls; otherwise Rustls panics when
+    // both `ring` and `aws-lc-rs` are available.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
     let system_config = Path::new("/etc/job-watcher/job-watcher.env");
     if system_config.is_file() {
         dotenvy::from_path(system_config)

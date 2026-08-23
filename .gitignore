@@ -9,6 +9,11 @@
 /jobs.sqlite3
 /changes/
 /.env
+/google-oauth-client.json
+/gmail-oauth-token.json
+/linkedin-processed-gmail-messages.json
+/var/
+/example_data/
 
 # Browser/test artifacts
 /test-results/

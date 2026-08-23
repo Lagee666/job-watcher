@@ -73,7 +73,7 @@ date-folder and 10-JD batch layout as the one-shot updater.
 
 Use `cargo run --release` for an optimized build. The process starts an Axum
 health server on `http://127.0.0.1:3004/` by default and runs the watcher immediately,
-then every day at 06:30 Asia/Taipei. The service also performs one
+then every day at 07:00 Asia/Taipei. The service also performs one
 synchronization when it starts:
 
 ```bash
@@ -130,12 +130,33 @@ sudo editor /etc/job-watcher/job-watcher.env
 ```
 
 The service automatically loads `/etc/job-watcher/job-watcher.env` when that
-file exists. It contains the HTTP port, LINE credentials, change directory, and
-optional Gmail settings. The local `.env` file is used only when the system
+file exists. It contains the HTTP port, LINE credentials, change directory,
+optional LinkedIn/Gmail API settings, and optional Gmail SMTP settings. The local `.env`
+file is used only when the system
 configuration file does not exist.
 
 Keep the file readable only by the account that runs the service because it
-contains the LINE channel access token.
+contains credentials and tokens.
+
+## Configure LinkedIn Job Alerts through Gmail
+
+LinkedIn support is disabled by default. Create a Google OAuth desktop client
+for the Gmail readonly scope, copy its client JSON to the protected path, and
+set the following in the system environment file:
+
+```dotenv
+LINKEDIN_ENABLED=true
+GMAIL_OAUTH_CLIENT_FILE=/etc/job-watcher/google-oauth-client.json
+GMAIL_OAUTH_TOKEN_FILE=/var/lib/job-watcher/gmail-oauth-token.json
+LINKEDIN_PROCESSED_MESSAGES_FILE=/var/lib/job-watcher/linkedin-processed-gmail-messages.json
+LINKEDIN_GMAIL_QUERY=from:(linkedin.com) newer_than:30d
+```
+
+On the Raspberry Pi, run `cargo run --bin gmail-auth` once with the client
+file and token-file settings present. Open the printed Google consent URL on a
+browser, approve Gmail read-only access, and return to the Pi. The resulting
+refresh token is stored in the token file and reused on later scheduled runs.
+The source uses no LinkedIn browser session or login cookie.
 
 ## Configure LINE notifications
 
@@ -177,7 +198,7 @@ The database stores each job's `last_updated`, `work_site`, and
 `annual_salary`. Existing databases receive these columns automatically on the
 next service start.
 
-When LINE is configured, startup and the scheduled 06:30 check send a daily
+When LINE is configured, startup and the scheduled 07:00 check send a daily
 count digest after SQLite/history persistence. `更新JD` runs the same pipeline immediately;
 `今日履歷` reads today's local history without contacting 104. When Gmail is
 configured, the daily history is sent as a JSON attachment.
