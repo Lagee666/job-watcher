@@ -959,6 +959,8 @@ mod tests {
 
     #[test]
     fn public_job_fixture_preserves_complete_description() {
+        let html = std::fs::read_to_string("src/source/fixture/linkedin_public.html")
+            .expect("LinkedIn public fixture should be readable");
         let job = enrich_from_html(
             AlertJob {
                 id: "4454432978".into(),
@@ -967,7 +969,7 @@ mod tests {
                 company: "Alert company".into(),
                 location: None,
             },
-            include_str!("fixture/linkedin_public.html"),
+            &html,
         );
         assert_eq!(job.fetch_state, "Complete");
         assert!(
@@ -1076,6 +1078,9 @@ mod tests {
     #[tokio::test]
     #[ignore]
     async fn example_data_fixture_extracts_complete_linkedin_description() {
+        let html = fs::read_to_string("example_data/linkedin_job_detail.html")
+            .await
+            .expect("LinkedIn detail fixture should be readable");
         let job = enrich_from_html_at(
             AlertJob {
                 id: "4418261323".into(),
@@ -1084,7 +1089,7 @@ mod tests {
                 company: "Unknown company".into(),
                 location: None,
             },
-            include_str!("../../example_data/linkedin_job_detail.html"),
+            &html,
             chrono::DateTime::parse_from_rfc3339("2026-08-20T00:00:00Z")
                 .unwrap()
                 .with_timezone(&chrono::Utc),
@@ -1118,6 +1123,9 @@ mod tests {
     #[tokio::test]
     #[ignore]
     async fn example_data_fixture_extracts_complete_linkedin_description_1() {
+        let html = fs::read_to_string("example_data/Applied Materials Taiwan.html")
+            .await
+            .expect("Applied Materials fixture should be readable");
         let job = enrich_from_html_at(
             AlertJob {
                 id: "4441813838".into(),
@@ -1126,7 +1134,7 @@ mod tests {
                 company: "Unknown company".into(),
                 location: None,
             },
-            include_str!("../../example_data/Applied Materials Taiwan.html"),
+            &html,
             chrono::DateTime::parse_from_rfc3339("2026-08-20T00:00:00Z")
                 .unwrap()
                 .with_timezone(&chrono::Utc),

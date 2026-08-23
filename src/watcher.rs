@@ -560,6 +560,18 @@ fn extract_total_pages(tab: &Tab) -> Result<usize> {
     Ok(pages)
 }
 
+struct TabCleanup {
+    tab: Arc<Tab>,
+}
+
+impl Drop for TabCleanup {
+    fn drop(&mut self) {
+        if let Err(error) = self.tab.close_target() {
+            debug!(error = %error, "failed to close Chromium page");
+        }
+    }
+}
+
 fn extract_detail(browser: &Browser, job: &JobListing) -> Result<String> {
     // Reuse one independent CDP connection, but close each detail target so
     // Chromium does not retain one browser target per job.
@@ -1116,6 +1128,9 @@ fn synchronize_104_and_linkedin(
     let detail_browser = Browser::connect(web_socket_debugger_url)
         .context("failed to connect to Chromium for JD details")?;
     let tab = browser.new_tab().context("failed to create Chromium tab")?;
+    let _tab_cleanup = TabCleanup {
+        tab: Arc::clone(&tab),
+    };
     tab.navigate_to(SEARCH_URL)?.wait_until_navigated()?;
     let title = tab.get_title()?;
     let html = tab.get_content()?;
