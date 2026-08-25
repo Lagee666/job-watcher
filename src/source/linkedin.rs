@@ -208,6 +208,9 @@ fn alert_metadata(alert: AlertJob) -> JobListing {
         published_at: None,
         platform_updated_at: None,
         fetch_state: "MetadataOnly".into(),
+        first_seen_at: None,
+        last_seen_at: None,
+        seen_count: 0,
     }
 }
 
@@ -342,6 +345,9 @@ fn enrich_from_html_at(alert: AlertJob, html: &str, scraped_at: DateTime<Utc>) -
         published_at,
         platform_updated_at: None,
         fetch_state: state.into(),
+        first_seen_at: None,
+        last_seen_at: None,
+        seen_count: 0,
     }
 }
 
@@ -359,6 +365,9 @@ fn metadata_only(alert: AlertJob, state: &str, detail: &str) -> JobListing {
         published_at: None,
         platform_updated_at: None,
         fetch_state: state.into(),
+        first_seen_at: None,
+        last_seen_at: None,
+        seen_count: 0,
     }
 }
 

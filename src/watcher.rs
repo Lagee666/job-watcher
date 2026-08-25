@@ -52,6 +52,12 @@ pub struct JobListing {
     pub platform_updated_at: Option<String>,
     #[serde(default = "default_fetch_state")]
     pub fetch_state: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_seen_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_seen_at: Option<String>,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub seen_count: i64,
 }
 
 fn default_source() -> String {
@@ -60,6 +66,10 @@ fn default_source() -> String {
 
 fn default_fetch_state() -> String {
     "Complete".into()
+}
+
+fn is_zero(value: &i64) -> bool {
+    *value == 0
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -80,6 +90,9 @@ pub struct ChangeRecord {
     pub description: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub deleted_at: Option<String>,
+    pub first_seen_at: Option<String>,
+    pub last_seen_at: Option<String>,
+    pub seen_count: i64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
@@ -624,7 +637,7 @@ fn extract_detail(browser: &Browser, job: &JobListing) -> Result<String> {
 }
 
 fn ensure_schema(connection: &Connection) -> Result<()> {
-    connection.execute_batch("CREATE TABLE IF NOT EXISTS jobs (source TEXT NOT NULL, external_id TEXT NOT NULL, title TEXT NOT NULL, company TEXT NOT NULL, location TEXT, salary TEXT, description TEXT, url TEXT NOT NULL, published_at TEXT, platform_updated_at TEXT, fetch_state TEXT NOT NULL DEFAULT 'Complete', work_site TEXT, annual_salary TEXT, last_updated TEXT, first_seen_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, last_seen_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, PRIMARY KEY(source, external_id));").context("failed to initialize SQLite schema")?;
+    connection.execute_batch("CREATE TABLE IF NOT EXISTS jobs (source TEXT NOT NULL, external_id TEXT NOT NULL, title TEXT NOT NULL, company TEXT NOT NULL, location TEXT, salary TEXT, description TEXT, url TEXT NOT NULL, published_at TEXT, platform_updated_at TEXT, fetch_state TEXT NOT NULL DEFAULT 'Complete', work_site TEXT, annual_salary TEXT, last_updated TEXT, first_seen_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, last_seen_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, seen_count INTEGER NOT NULL DEFAULT 1, PRIMARY KEY(source, external_id));").context("failed to initialize SQLite schema")?;
     for (name, definition) in [
         ("work_site", "TEXT"),
         ("annual_salary", "TEXT"),
@@ -632,6 +645,9 @@ fn ensure_schema(connection: &Connection) -> Result<()> {
         ("description", "TEXT"),
         ("platform_updated_at", "TEXT"),
         ("fetch_state", "TEXT NOT NULL DEFAULT 'Complete'"),
+        ("first_seen_at", "TEXT"),
+        ("last_seen_at", "TEXT"),
+        ("seen_count", "INTEGER NOT NULL DEFAULT 1"),
     ] {
         let exists: bool = connection
             .prepare("SELECT 1 FROM pragma_table_info('jobs') WHERE name=?1")?
@@ -643,11 +659,15 @@ fn ensure_schema(connection: &Connection) -> Result<()> {
             )?;
         }
     }
+    connection.execute(
+        "UPDATE jobs SET first_seen_at=COALESCE(NULLIF(first_seen_at,''),published_at,CURRENT_TIMESTAMP), last_seen_at=COALESCE(NULLIF(last_seen_at,''),CURRENT_TIMESTAMP), seen_count=COALESCE(NULLIF(seen_count,0),1)",
+        [],
+    )?;
     Ok(())
 }
 
 fn load_known_jobs(connection: &Connection) -> Result<HashMap<String, JobListing>> {
-    let mut statement = connection.prepare("SELECT source,external_id,title,company,COALESCE(work_site,location),COALESCE(annual_salary,salary),description,url,published_at,platform_updated_at,fetch_state FROM jobs WHERE source='104'")?;
+    let mut statement = connection.prepare("SELECT source,external_id,title,company,COALESCE(work_site,location),COALESCE(annual_salary,salary),description,url,published_at,platform_updated_at,fetch_state,first_seen_at,last_seen_at,seen_count FROM jobs WHERE source='104'")?;
     let rows = statement.query_map([], |row| {
         Ok(JobListing {
             source: row.get(0)?,
@@ -661,6 +681,9 @@ fn load_known_jobs(connection: &Connection) -> Result<HashMap<String, JobListing
             published_at: row.get(8)?,
             platform_updated_at: row.get(9)?,
             fetch_state: row.get(10)?,
+            first_seen_at: row.get(11)?,
+            last_seen_at: row.get(12)?,
+            seen_count: row.get(13)?,
         })
     })?;
     rows.map(|row| row.map(|job| (job.external_id.clone(), job)))
@@ -669,7 +692,7 @@ fn load_known_jobs(connection: &Connection) -> Result<HashMap<String, JobListing
 }
 
 fn load_all_known_jobs(connection: &Connection) -> Result<HashMap<(String, String), JobListing>> {
-    let mut statement = connection.prepare("SELECT source,external_id,title,company,COALESCE(work_site,location),COALESCE(annual_salary,salary),description,url,published_at,platform_updated_at,fetch_state FROM jobs")?;
+    let mut statement = connection.prepare("SELECT source,external_id,title,company,COALESCE(work_site,location),COALESCE(annual_salary,salary),description,url,published_at,platform_updated_at,fetch_state,first_seen_at,last_seen_at,seen_count FROM jobs")?;
     let rows = statement.query_map([], |row| {
         Ok(JobListing {
             source: row.get(0)?,
@@ -683,6 +706,9 @@ fn load_all_known_jobs(connection: &Connection) -> Result<HashMap<(String, Strin
             published_at: row.get(8)?,
             platform_updated_at: row.get(9)?,
             fetch_state: row.get(10)?,
+            first_seen_at: row.get(11)?,
+            last_seen_at: row.get(12)?,
+            seen_count: row.get(13)?,
         })
     })?;
     rows.map(|row| row.map(|job| ((job.source.clone(), job.external_id.clone()), job)))
@@ -737,6 +763,23 @@ fn listing_fields_changed(old: &JobListing, new: &JobListing) -> bool {
         .any(|field| field != "description")
 }
 
+fn copy_tracking(target: &mut JobListing, persisted: &JobListing) {
+    target.first_seen_at = persisted.first_seen_at.clone();
+    target.last_seen_at = persisted.last_seen_at.clone();
+    target.seen_count = persisted.seen_count;
+}
+
+fn apply_run_tracking(job: &mut JobListing, old: Option<&JobListing>, run_at: &str) {
+    job.first_seen_at = old
+        .and_then(|previous| previous.first_seen_at.clone())
+        .or_else(|| job.published_at.clone())
+        .or_else(|| Some(run_at.to_owned()));
+    job.last_seen_at = Some(run_at.to_owned());
+    job.seen_count = old
+        .map(|previous| previous.seen_count.max(1) + 1)
+        .unwrap_or(1);
+}
+
 fn change_record(
     kind: &str,
     job: &JobListing,
@@ -756,6 +799,9 @@ fn change_record(
         changed_fields: fields,
         description: job.description.clone(),
         deleted_at,
+        first_seen_at: job.first_seen_at.clone(),
+        last_seen_at: job.last_seen_at.clone(),
+        seen_count: job.seen_count,
     }
 }
 
@@ -765,14 +811,19 @@ fn persist_state(
     jobs: &[JobListing],
     ids: &HashSet<String>,
     allow_deletions: bool,
+    run_at: &str,
 ) -> Result<()> {
     ensure_schema(connection)?;
     let tx = connection
         .transaction()
         .context("failed to begin SQLite state transaction")?;
     {
-        let mut statement = tx.prepare("INSERT INTO jobs(source,external_id,title,company,location,salary,description,url,published_at,platform_updated_at,fetch_state,work_site,annual_salary,last_updated) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?5,?6,COALESCE(?10,?9)) ON CONFLICT(source,external_id) DO UPDATE SET title=excluded.title,company=excluded.company,location=excluded.location,salary=excluded.salary,description=COALESCE(excluded.description,jobs.description),url=excluded.url,published_at=excluded.published_at,platform_updated_at=excluded.platform_updated_at,fetch_state=excluded.fetch_state,work_site=excluded.work_site,annual_salary=excluded.annual_salary,last_updated=excluded.last_updated,last_seen_at=CURRENT_TIMESTAMP")?;
+        let mut statement = tx.prepare("INSERT INTO jobs(source,external_id,title,company,location,salary,description,url,published_at,platform_updated_at,fetch_state,work_site,annual_salary,last_updated,first_seen_at,last_seen_at,seen_count) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?5,?6,COALESCE(?10,?9),COALESCE(?9,?12),?12,1) ON CONFLICT(source,external_id) DO UPDATE SET title=excluded.title,company=excluded.company,location=excluded.location,salary=excluded.salary,description=COALESCE(excluded.description,jobs.description),url=excluded.url,published_at=excluded.published_at,platform_updated_at=excluded.platform_updated_at,fetch_state=excluded.fetch_state,work_site=excluded.work_site,annual_salary=excluded.annual_salary,last_updated=excluded.last_updated,first_seen_at=COALESCE(jobs.first_seen_at,excluded.first_seen_at),last_seen_at=excluded.last_seen_at,seen_count=COALESCE(jobs.seen_count,0)+1")?;
+        let mut persisted_ids = HashSet::new();
         for job in jobs {
+            if !persisted_ids.insert(job.external_id.clone()) {
+                continue;
+            }
             statement
                 .execute(params![
                     source,
@@ -785,7 +836,8 @@ fn persist_state(
                     job.url,
                     job.published_at,
                     job.platform_updated_at,
-                    job.fetch_state
+                    job.fetch_state,
+                    run_at
                 ])
                 .with_context(|| format!("failed to persist job {}", job.external_id))?;
         }
@@ -1013,7 +1065,7 @@ fn synchronize(
 fn synchronize_linkedin_only(
     trigger: &str,
     notifier: Option<&LineNotifier>,
-    snapshot: SourceSnapshot,
+    mut snapshot: SourceSnapshot,
 ) -> Result<SyncSummary> {
     let now = taipei_now()?;
     let generated_at = now.to_rfc3339();
@@ -1026,27 +1078,29 @@ fn synchronize_linkedin_only(
         trigger: trigger.into(),
         ..Default::default()
     };
-    let ids = merge_snapshot(&mut summary, &snapshot, &known, &generated_at);
+    let ids = merge_snapshot(&mut summary, &mut snapshot, &known, &generated_at);
     persist_state(
         &mut connection,
         &snapshot.source,
         &snapshot.jobs,
         &ids,
         snapshot.allow_deletions,
+        &generated_at,
     )?;
     finish_summary(summary, notifier)
 }
 
 fn merge_snapshot(
     summary: &mut SyncSummary,
-    snapshot: &SourceSnapshot,
+    snapshot: &mut SourceSnapshot,
     known: &HashMap<(String, String), JobListing>,
     generated_at: &str,
 ) -> HashSet<String> {
     let mut ids = HashSet::new();
-    for job in &snapshot.jobs {
-        ids.insert(job.external_id.clone());
+    for job in &mut snapshot.jobs {
         let key = (snapshot.source.clone(), job.external_id.clone());
+        apply_run_tracking(job, known.get(&key), generated_at);
+        ids.insert(job.external_id.clone());
         if let Some(old) = known.get(&key) {
             let fields = changed_fields(old, job);
             if !fields.is_empty() {
@@ -1189,6 +1243,8 @@ fn synchronize_104_and_linkedin(
     };
     let mut current = Vec::with_capacity(total_jobs);
     for (index, mut job) in search_jobs.into_iter().enumerate() {
+        let external_id = job.external_id.clone();
+        apply_run_tracking(&mut job, known.get(&external_id), &generated_at);
         let remaining = total_jobs.saturating_sub(index + 1);
         info!(
             job_number = index + 1,
@@ -1294,17 +1350,22 @@ fn synchronize_104_and_linkedin(
     }
     match LinkedInAlertSource::from_env() {
         Ok(Some(linkedin)) => match linkedin.acquire() {
-            Ok(snapshot) => {
+            Ok(mut snapshot) => {
                 let known_all = load_all_known_jobs(&connection)?;
                 let mut linkedin_summary = summary.clone();
-                let linkedin_ids =
-                    merge_snapshot(&mut linkedin_summary, &snapshot, &known_all, &generated_at);
+                let linkedin_ids = merge_snapshot(
+                    &mut linkedin_summary,
+                    &mut snapshot,
+                    &known_all,
+                    &generated_at,
+                );
                 if let Err(error) = persist_state(
                     &mut connection,
                     linkedin.source_name(),
                     &snapshot.jobs,
                     &linkedin_ids,
                     snapshot.allow_deletions,
+                    &generated_at,
                 ) {
                     error!(error = %error, "LinkedIn state persistence failed; preserving previous LinkedIn state");
                 } else {
@@ -1330,9 +1391,16 @@ fn synchronize_104_and_linkedin(
         unchanged,
         "change comparison complete"
     );
+    persist_state(&mut connection, SOURCE, &current, &ids, true, &generated_at)?;
+    let persisted_jobs = load_all_known_jobs(&connection)?;
+    for job in &mut current {
+        if let Some(persisted) = persisted_jobs.get(&(job.source.clone(), job.external_id.clone()))
+        {
+            copy_tracking(job, persisted);
+        }
+    }
     fs::write("job-list.json", serde_json::to_vec_pretty(&current)?)
         .context("failed to save extracted job list")?;
-    persist_state(&mut connection, SOURCE, &current, &ids, true)?;
     info!(current_jobs = current.len(), "SQLite state committed");
     if let Some(writer) = job_writer
         && let Err(error) = writer.finish()
@@ -1612,6 +1680,7 @@ mod tests {
             std::slice::from_ref(&a),
             &HashSet::from([a.external_id.clone()]),
             true,
+            "2026-08-23T07:00:00+08:00",
         )
         .unwrap();
         assert_eq!(load_known_jobs(&c).unwrap().len(), 1);
@@ -1623,13 +1692,122 @@ mod tests {
             std::slice::from_ref(&linkedin),
             &HashSet::from([linkedin.external_id.clone()]),
             false,
+            "2026-08-23T07:00:00+08:00",
         )
         .unwrap();
         assert_eq!(load_all_known_jobs(&c).unwrap().len(), 2);
-        persist_state(&mut c, SOURCE, &[], &HashSet::new(), true).unwrap();
+        persist_state(
+            &mut c,
+            SOURCE,
+            &[],
+            &HashSet::new(),
+            true,
+            "2026-08-24T07:00:00+08:00",
+        )
+        .unwrap();
         assert!(load_known_jobs(&c).unwrap().is_empty());
         assert_eq!(load_all_known_jobs(&c).unwrap().len(), 1);
     }
+
+    fn tracking(c: &Connection, source: &str, external_id: &str) -> (String, String, i64) {
+        c.query_row(
+            "SELECT first_seen_at,last_seen_at,seen_count FROM jobs WHERE source=?1 AND external_id=?2",
+            rusqlite::params![source, external_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn seen_tracking_uses_published_time_and_counts_distinct_runs() {
+        let mut c = Connection::open_in_memory().unwrap();
+        let mut job = sample();
+        job.published_at = Some("2026-08-20T00:00:00+08:00".into());
+        let ids = HashSet::from([job.external_id.clone()]);
+
+        persist_state(
+            &mut c,
+            SOURCE,
+            &[job.clone(), job.clone()],
+            &ids,
+            false,
+            "2026-08-23T07:00:00+08:00",
+        )
+        .unwrap();
+        assert_eq!(
+            tracking(&c, SOURCE, &job.external_id),
+            (
+                "2026-08-20T00:00:00+08:00".into(),
+                "2026-08-23T07:00:00+08:00".into(),
+                1
+            )
+        );
+
+        persist_state(
+            &mut c,
+            SOURCE,
+            std::slice::from_ref(&job),
+            &ids,
+            false,
+            "2026-08-25T07:00:00+08:00",
+        )
+        .unwrap();
+        assert_eq!(
+            tracking(&c, SOURCE, &job.external_id),
+            (
+                "2026-08-20T00:00:00+08:00".into(),
+                "2026-08-25T07:00:00+08:00".into(),
+                2
+            )
+        );
+    }
+
+    #[test]
+    fn seen_tracking_without_published_time_uses_first_run_time_and_survives_reload() {
+        let path =
+            std::env::temp_dir().join(format!("job-watcher-seen-{}.sqlite3", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let mut job = sample();
+        job.external_id = "no-published-date".into();
+        job.published_at = None;
+        {
+            let mut c = Connection::open(&path).unwrap();
+            persist_state(
+                &mut c,
+                SOURCE,
+                std::slice::from_ref(&job),
+                &HashSet::from([job.external_id.clone()]),
+                false,
+                "2026-08-23T07:00:00+08:00",
+            )
+            .unwrap();
+        }
+        {
+            let c = Connection::open(&path).unwrap();
+            assert_eq!(
+                tracking(&c, SOURCE, &job.external_id),
+                (
+                    "2026-08-23T07:00:00+08:00".into(),
+                    "2026-08-23T07:00:00+08:00".into(),
+                    1
+                )
+            );
+        }
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn legacy_jobs_receive_tracking_defaults_without_resetting_published_history() {
+        let c = Connection::open_in_memory().unwrap();
+        c.execute_batch("CREATE TABLE jobs (source TEXT NOT NULL, external_id TEXT NOT NULL, title TEXT NOT NULL, company TEXT NOT NULL, location TEXT, salary TEXT, description TEXT, url TEXT NOT NULL, published_at TEXT, platform_updated_at TEXT, fetch_state TEXT NOT NULL DEFAULT 'Complete', work_site TEXT, annual_salary TEXT, last_updated TEXT, PRIMARY KEY(source, external_id)); INSERT INTO jobs(source,external_id,title,company,url,published_at) VALUES('linkedin','legacy','Old','Company','https://www.linkedin.com/jobs/view/legacy/','2026-08-20');")
+            .unwrap();
+        ensure_schema(&c).unwrap();
+        let state = tracking(&c, "linkedin", "legacy");
+        assert_eq!(state.0, "2026-08-20");
+        assert!(!state.1.is_empty());
+        assert_eq!(state.2, 1);
+    }
+
     #[test]
     fn challenge_pages_are_rejected() {
         assert!(is_challenge_page("Just a moment...", "challenge-platform"));
@@ -1647,7 +1825,11 @@ mod tests {
 
     #[test]
     fn history_schema_preserves_multiple_runs_and_full_description() {
-        let record = change_record("updated", &sample(), vec!["description".into()], None);
+        let mut listed = sample();
+        listed.first_seen_at = Some("2026-08-20T00:00:00+08:00".into());
+        listed.last_seen_at = Some("2026-08-25T07:00:00+08:00".into());
+        listed.seen_count = 2;
+        let record = change_record("updated", &listed, vec!["description".into()], None);
         let history = ChangeHistory {
             date: "2026-08-16".into(),
             runs: vec![HistoryRun {
@@ -1661,6 +1843,8 @@ mod tests {
         let json = serde_json::to_string(&history).unwrap();
         assert!(json.contains("description"));
         assert!(json.contains("2026-08-16T14:30:00+08:00"));
+        assert!(json.contains("2026-08-20T00:00:00+08:00"));
+        assert!(json.contains("\"seen_count\":2"));
         assert_eq!(
             serde_json::from_str::<ChangeHistory>(&json)
                 .unwrap()
@@ -1682,6 +1866,9 @@ mod tests {
             published_at: Some("8/16".into()),
             platform_updated_at: None,
             fetch_state: "Complete".into(),
+            first_seen_at: None,
+            last_seen_at: None,
+            seen_count: 0,
         }
     }
 }
