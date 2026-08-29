@@ -64,6 +64,12 @@ parsing, public-page mapping, and failure safety. Set `LINKEDIN_ENABLED=true`,
 provide `GMAIL_OAUTH_CLIENT_FILE` and `GMAIL_OAUTH_TOKEN_FILE`, and configure
 `LINKEDIN_GMAIL_QUERY` if the default search is not suitable.
 
+During synchronization, LinkedIn IDs already present in SQLite are reused
+without another public-page HTTP request. Their `last_seen_at` and `seen_count`
+are updated, and they are included as updated jobs in the combined change
+history, Gmail summary, and `job-list.json`. Only newly discovered LinkedIn IDs
+need detail-page fetching.
+
 Search cards provide summary fields. New and known jobs are opened in a second
 normal Chromium tab and the complete visible detail text is extracted. A detail
 failure is logged; a previous valid JD is preserved and empty failed content

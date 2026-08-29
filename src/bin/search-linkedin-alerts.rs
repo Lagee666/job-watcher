@@ -1,8 +1,5 @@
 use anyhow::{Context, Result};
-use job_watcher::{
-    load_environment,
-    source::{JobSource, linkedin::LinkedInAlertSource},
-};
+use job_watcher::{load_environment, source::linkedin::LinkedInAlertSource};
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 
@@ -27,7 +24,7 @@ fn run() -> Result<()> {
     let source = LinkedInAlertSource::from_env()?
         .context("set LINKEDIN_ENABLED=true and configure Gmail OAuth before searching alerts")?;
     info!("searching Gmail for LinkedIn Job Alert messages");
-    let jobs = source.acquire()?.jobs;
+    let jobs = source.search_alerts()?;
     info!(
         job_count = jobs.len(),
         "LinkedIn Job Alert search completed"

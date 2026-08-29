@@ -770,6 +770,11 @@ fn copy_tracking(target: &mut JobListing, persisted: &JobListing) {
     target.seen_count = persisted.seen_count;
 }
 
+fn write_job_list(jobs: &[JobListing]) -> Result<()> {
+    fs::write("job-list.json", serde_json::to_vec_pretty(jobs)?)
+        .context("failed to save extracted job list")
+}
+
 fn apply_run_tracking(job: &mut JobListing, old: Option<&JobListing>, run_at: &str) {
     job.first_seen_at = old
         .and_then(|previous| previous.first_seen_at.clone())
@@ -1046,7 +1051,8 @@ fn synchronize(
             let Ok(Some(linkedin)) = LinkedInAlertSource::from_env() else {
                 return Err(error);
             };
-            let snapshot = match linkedin.acquire() {
+            let known_linkedin = load_known_linkedin_for_acquisition()?;
+            let snapshot = match linkedin.acquire_with_known(&known_linkedin) {
                 Ok(snapshot) => snapshot,
                 Err(linkedin_error) => {
                     error!(
@@ -1061,6 +1067,15 @@ fn synchronize(
             synchronize_linkedin_only(trigger, notifier, snapshot)
         }
     }
+}
+
+fn load_known_linkedin_for_acquisition() -> Result<HashMap<String, JobListing>> {
+    let connection = Connection::open("jobs.sqlite3").context("failed to open jobs.sqlite3")?;
+    ensure_schema(&connection)?;
+    Ok(load_all_known_jobs(&connection)?
+        .into_iter()
+        .filter_map(|((source, id), job)| (source == "linkedin").then_some((id, job)))
+        .collect())
 }
 
 fn synchronize_linkedin_only(
@@ -1088,6 +1103,13 @@ fn synchronize_linkedin_only(
         snapshot.allow_deletions,
         &generated_at,
     )?;
+    let persisted = load_all_known_jobs(&connection)?;
+    for job in &mut snapshot.jobs {
+        if let Some(saved) = persisted.get(&(job.source.clone(), job.external_id.clone())) {
+            copy_tracking(job, saved);
+        }
+    }
+    write_job_list(&snapshot.jobs)?;
     finish_summary(summary, notifier)
 }
 
@@ -1104,7 +1126,7 @@ fn merge_snapshot(
         ids.insert(job.external_id.clone());
         if let Some(old) = known.get(&key) {
             let fields = changed_fields(old, job);
-            if !fields.is_empty() {
+            if !fields.is_empty() || snapshot.source == "linkedin" {
                 summary
                     .updated
                     .push(change_record("updated", job, fields, None));
@@ -1349,34 +1371,44 @@ fn synchronize_104_and_linkedin(
             ));
         }
     }
+    let mut linkedin_jobs = Vec::new();
     match LinkedInAlertSource::from_env() {
-        Ok(Some(linkedin)) => match linkedin.acquire() {
-            Ok(mut snapshot) => {
-                let known_all = load_all_known_jobs(&connection)?;
-                let mut linkedin_summary = summary.clone();
-                let linkedin_ids = merge_snapshot(
-                    &mut linkedin_summary,
-                    &mut snapshot,
-                    &known_all,
-                    &generated_at,
-                );
-                if let Err(error) = persist_state(
-                    &mut connection,
-                    linkedin.source_name(),
-                    &snapshot.jobs,
-                    &linkedin_ids,
-                    snapshot.allow_deletions,
-                    &generated_at,
-                ) {
-                    error!(error = %error, "LinkedIn state persistence failed; preserving previous LinkedIn state");
-                } else {
-                    summary = linkedin_summary;
+        Ok(Some(linkedin)) => {
+            let known_all = load_all_known_jobs(&connection)?;
+            let known_linkedin = known_all
+                .iter()
+                .filter_map(|((source, id), job)| {
+                    (source == "linkedin").then_some((id.clone(), job.clone()))
+                })
+                .collect();
+            match linkedin.acquire_with_known(&known_linkedin) {
+                Ok(mut snapshot) => {
+                    let mut linkedin_summary = summary.clone();
+                    let linkedin_ids = merge_snapshot(
+                        &mut linkedin_summary,
+                        &mut snapshot,
+                        &known_all,
+                        &generated_at,
+                    );
+                    if let Err(error) = persist_state(
+                        &mut connection,
+                        linkedin.source_name(),
+                        &snapshot.jobs,
+                        &linkedin_ids,
+                        snapshot.allow_deletions,
+                        &generated_at,
+                    ) {
+                        error!(error = %error, "LinkedIn state persistence failed; preserving previous LinkedIn state");
+                    } else {
+                        linkedin_jobs = snapshot.jobs;
+                        summary = linkedin_summary;
+                    }
+                }
+                Err(error) => {
+                    error!(error = %error, "LinkedIn acquisition failed; preserving existing LinkedIn jobs");
                 }
             }
-            Err(error) => {
-                error!(error = %error, "LinkedIn acquisition failed; preserving existing LinkedIn jobs");
-            }
-        },
+        }
         Ok(None) => {}
         Err(error) => {
             error!(error = %error, "LinkedIn configuration invalid; preserving existing LinkedIn jobs");
@@ -1400,8 +1432,9 @@ fn synchronize_104_and_linkedin(
             copy_tracking(job, persisted);
         }
     }
-    fs::write("job-list.json", serde_json::to_vec_pretty(&current)?)
-        .context("failed to save extracted job list")?;
+    let mut job_list = current.clone();
+    job_list.extend(linkedin_jobs);
+    write_job_list(&job_list)?;
     info!(current_jobs = current.len(), "SQLite state committed");
     if let Some(writer) = job_writer
         && let Err(error) = writer.finish()

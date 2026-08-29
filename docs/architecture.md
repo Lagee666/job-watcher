@@ -33,6 +33,9 @@ contact 104.
    cannot cause mass deletions. LinkedIn deletion comparison is source-scoped.
 3. Normalize both sources into the same Job model and deduplicate LinkedIn
    results by `(source, external_id)`.
+   LinkedIn IDs already stored in SQLite reuse their stored normalized record;
+   they do not trigger another detail-page HTTP request. Their seen-tracking
+   fields are updated and they remain eligible for the combined Updated report.
 4. Compare `(source, external_id)` and normalized meaningful fields.
 5. Commit all source upserts and safe deletions in the shared SQLite table.
 6. Append one combined run to today's history JSON.
@@ -40,7 +43,9 @@ contact 104.
 8. Send the scheduled/manual digest. When Gmail is configured, the message uses
    `YYYY/MM/DD JD更新` as its subject, contains the three change counts plus
    each changed job's title and URL, and attaches that day's `YYYY-MM-DD.json`
-   history. Downstream failures never roll back the committed SQLite state.
+   history. The Gmail body includes each changed job's title and URL, and
+   `job-list.json` contains the current 104 and discovered LinkedIn listings.
+   Downstream failures never roll back the committed SQLite state.
 
 A failed history write is reported as an export failure. Gmail and LINE failures
 are logged after persistence/export.

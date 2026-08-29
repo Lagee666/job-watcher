@@ -96,26 +96,50 @@ impl LinkedInAlertSource {
         let (alerts, _) = self.discover(false)?;
         Ok(alerts.into_iter().map(alert_metadata).collect())
     }
-}
 
-impl JobSource for LinkedInAlertSource {
-    fn source_name(&self) -> &'static str {
-        SOURCE
-    }
-
-    fn acquire(&self) -> Result<SourceSnapshot> {
-        let (alerts, processed_message_ids) = self.discover(true)?;
-        let client = Client::builder()
-            .timeout(Duration::from_secs(30))
-            .user_agent("job-watcher/1.0 (+public LinkedIn job page fetch)")
-            .build()
-            .context("failed to initialize LinkedIn public-page client")?;
+    pub fn acquire_with_known(
+        &self,
+        known: &std::collections::HashMap<String, JobListing>,
+    ) -> Result<SourceSnapshot> {
+        // Re-read matching alerts on each synchronization. SQL job identity,
+        // rather than Gmail message state, determines whether detail fetching
+        // is needed and lets known jobs update their seen counters.
+        let (alerts, processed_message_ids) = self.discover(false)?;
+        let unknown_alerts = alerts
+            .iter()
+            .filter(|alert| !known.contains_key(&alert.id))
+            .count();
+        let client = if unknown_alerts > 0 {
+            Some(
+                Client::builder()
+                    .timeout(Duration::from_secs(30))
+                    .user_agent("job-watcher/1.0 (+public LinkedIn job page fetch)")
+                    .build()
+                    .context("failed to initialize LinkedIn public-page client")?,
+            )
+        } else {
+            None
+        };
         let mut jobs = Vec::with_capacity(alerts.len());
-        for (index, alert) in alerts.into_iter().enumerate() {
-            if index > 0 {
+        let mut fetched = 0;
+        for alert in alerts {
+            if let Some(existing) = known.get(&alert.id) {
+                info!(
+                    job_id = %alert.id,
+                    url = %alert.url,
+                    "LinkedIn job already exists in SQLite; updating seen tracking without HTTP fetch"
+                );
+                jobs.push(existing.clone());
+                continue;
+            }
+            if fetched > 0 {
                 thread::sleep(Duration::from_secs(10));
             }
-            jobs.push(fetch_job(&client, alert));
+            fetched += 1;
+            jobs.push(fetch_job(
+                client.as_ref().expect("client exists for unknown alert"),
+                alert,
+            ));
         }
         if jobs.iter().all(|job| job.fetch_state == "Complete") {
             record_processed_messages(&processed_message_file(), &processed_message_ids)?;
@@ -126,6 +150,16 @@ impl JobSource for LinkedInAlertSource {
             processed_message_ids,
             allow_deletions: false,
         })
+    }
+}
+
+impl JobSource for LinkedInAlertSource {
+    fn source_name(&self) -> &'static str {
+        SOURCE
+    }
+
+    fn acquire(&self) -> Result<SourceSnapshot> {
+        self.acquire_with_known(&std::collections::HashMap::new())
     }
 }
 
