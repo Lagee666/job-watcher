@@ -38,9 +38,9 @@ contact 104.
 6. Append one combined run to today's history JSON.
 7. Retain seven calendar days locally.
 8. Send the scheduled/manual digest. When Gmail is configured, the message uses
-   `YYYY/MM/DD JD更新` as its subject, contains only the three change counts,
-   and attaches that day's `YYYY-MM-DD.json` history. Downstream failures never
-   roll back the committed SQLite state.
+   `YYYY/MM/DD JD更新` as its subject, contains the three change counts plus
+   each changed job's title and URL, and attaches that day's `YYYY-MM-DD.json`
+   history. Downstream failures never roll back the committed SQLite state.
 
 A failed history write is reported as an export failure. Gmail and LINE failures
 are logged after persistence/export.

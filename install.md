@@ -201,7 +201,9 @@ next service start.
 When LINE is configured, startup and the scheduled 07:00 check send a daily
 count digest after SQLite/history persistence. `更新JD` runs the same pipeline immediately;
 `今日履歷` reads today's local history without contacting 104. When Gmail is
-configured, the daily history is sent as a JSON attachment.
+configured, the email body contains counts plus each changed job's title and
+URL, and the daily history is sent as a JSON attachment. To resend the latest
+saved history without synchronizing, run `cargo run --bin send-latest-changes`.
 
 If Chromium is not listening on port `9222`, the watcher reports a connection
 error. The project uses normal public-page rendering and does not bypass

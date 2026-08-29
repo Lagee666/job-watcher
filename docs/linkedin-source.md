@@ -72,8 +72,8 @@ SQLite, change history, or the processed-message state.
 
 ## Public LinkedIn page mapping
 
-The normalized public URL is fetched with a conservative sequential HTTP
-client. No authentication is sent. The parser first checks `JobPosting`
+The normalized public URL is fetched with conservative sequential HTTP
+requests, waiting ten seconds between links. No authentication is sent. The parser first checks `JobPosting`
 JSON-LD, then stable metadata/description structures such as `og:title`,
 `show-more-less-html__markup`, `description__text`, and
 `job-description`.

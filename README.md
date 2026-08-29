@@ -89,10 +89,11 @@ are retained. Earlier runs on the same day are never overwritten.
 When `GMAIL_SMTP_USERNAME`, `GMAIL_SMTP_APP_PASSWORD`, and
 `JOB_WATCHER_EMAIL_TO` are configured,
 each successful synchronization also sends a Gmail message with subject
-`YYYY/MM/DD JD更新`, a body containing only the `新增`, `更新`, and `刪除` counts,
-and the complete daily history attached as `YYYY-MM-DD.json`. The SMTP password
-must be a Gmail app password. Gmail delivery failures are logged and do not
-roll back the synchronization.
+`YYYY/MM/DD JD更新`. The body contains the `新增`, `更新`, and `刪除` counts,
+followed by the title and URL of each changed job. The complete daily history
+is attached as `YYYY-MM-DD.json`. The SMTP password must be a Gmail app
+password. Gmail delivery failures are logged and do not roll back the
+synchronization.
 
 To verify SMTP delivery manually without running a synchronization:
 
@@ -102,6 +103,15 @@ job-watcher --test-email
 
 This sends the production-formatted test message and does not access 104 or
 modify SQLite or change history.
+
+To send the latest saved change history without running a synchronization:
+
+```bash
+cargo run --bin send-latest-changes
+```
+
+This sends the latest run's counts, job titles, and URLs with the existing
+daily JSON file attached. It does not modify SQLite or change history.
 
 To inspect LinkedIn Job Alert URLs from Gmail without fetching LinkedIn pages
 or modifying SQLite/history:
