@@ -16,7 +16,7 @@ is history/export only and is never used as current state.
 ## Runtime paths
 
 Axum and the in-process scheduler share a `Service`. The scheduler waits for
-startup and then the next `07:00 Asia/Taipei` instant. Webhook
+startup and then the next `06:30 Asia/Taipei` instant. Webhook
 handling recognizes `更新JD` and `今日履歷`. Browser, Gmail API, SQLite, filesystem,
 SMTP, and LINE calls run on blocking threads rather than Tokio executor
 threads.

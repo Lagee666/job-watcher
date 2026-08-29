@@ -1644,7 +1644,7 @@ fn next_scheduled_run() -> Result<Duration> {
     let now = Utc::now().with_timezone(&offset);
     let today = now.date_naive();
     let candidate = |date: NaiveDate| match offset
-        .from_local_datetime(&date.and_hms_opt(7, 0, 0).context("invalid 07:00")?)
+        .from_local_datetime(&date.and_hms_opt(6, 30, 0).context("invalid 06:30")?)
     {
         LocalResult::Single(value) => Ok(value),
         _ => anyhow::bail!("ambiguous Taipei scheduled time"),
@@ -1667,7 +1667,7 @@ fn next_scheduled_run() -> Result<Duration> {
 }
 
 pub fn run_service(service: Service) -> Result<()> {
-    info!("running startup synchronization; automatic schedule is 07:00 Asia/Taipei");
+    info!("running startup synchronization; automatic schedule is 06:30 Asia/Taipei");
     if let Err(error) = service.try_synchronize("startup") {
         error!(error = %error, "startup synchronization failed");
     }

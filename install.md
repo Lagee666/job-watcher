@@ -73,7 +73,7 @@ date-folder and 10-JD batch layout as the one-shot updater.
 
 Use `cargo run --release` for an optimized build. The process starts an Axum
 health server on `http://127.0.0.1:3004/` by default and runs the watcher immediately,
-then every day at 07:00 Asia/Taipei. The service also performs one
+then every day at 06:30 Asia/Taipei. The service also performs one
 synchronization when it starts:
 
 ```bash
@@ -198,7 +198,7 @@ The database stores each job's `last_updated`, `work_site`, and
 `annual_salary`. Existing databases receive these columns automatically on the
 next service start.
 
-When LINE is configured, startup and the scheduled 07:00 check send a daily
+When LINE is configured, startup and the scheduled 06:30 check send a daily
 count digest after SQLite/history persistence. `更新JD` runs the same pipeline immediately;
 `今日履歷` reads today's local history without contacting 104. When Gmail is
 configured, the email body contains counts plus each changed job's title and

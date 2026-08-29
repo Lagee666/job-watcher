@@ -13,7 +13,7 @@ Axum listens on port `3004` by default and accepts `POST /webhook`. Browser,
 SQLite, filesystem, SMTP, and LINE work runs off the Tokio executor.
 
 The service synchronizes all enabled sources once at startup and automatically every day at
-`07:00 Asia/Taipei`. Automatic `17:00` and `21:30` runs are removed.
+`06:30 Asia/Taipei`. Automatic `17:00` and `21:30` runs are removed.
 
 LINE commands:
 
