@@ -113,7 +113,7 @@ impl JobSource for LinkedInAlertSource {
         let mut jobs = Vec::with_capacity(alerts.len());
         for (index, alert) in alerts.into_iter().enumerate() {
             if index > 0 {
-                thread::sleep(Duration::from_millis(750));
+                thread::sleep(Duration::from_secs(1));
             }
             jobs.push(fetch_job(&client, alert));
         }
