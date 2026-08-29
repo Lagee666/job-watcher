@@ -1525,12 +1525,26 @@ fn gmail_subject(summary: &SyncSummary) -> Result<String> {
 }
 
 fn gmail_body(summary: &SyncSummary) -> String {
-    format!(
+    let mut body = format!(
         "新增：{}\n更新：{}\n刪除：{}",
         summary.new.len(),
         summary.updated.len(),
         summary.deleted.len()
-    )
+    );
+    for (label, jobs) in [
+        ("新增職缺", &summary.new),
+        ("更新職缺", &summary.updated),
+        ("刪除職缺", &summary.deleted),
+    ] {
+        if jobs.is_empty() {
+            continue;
+        }
+        body.push_str(&format!("\n\n{label}:"));
+        for job in jobs {
+            body.push_str(&format!("\n{}\n{}", job.title, job.url));
+        }
+    }
+    body
 }
 
 fn mime_message(
@@ -1669,7 +1683,10 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(gmail_subject(&summary).unwrap(), "2026/08/19 JD更新");
-        assert_eq!(gmail_body(&summary), "新增：1\n更新：1\n刪除：0");
+        let body = gmail_body(&summary);
+        assert!(body.starts_with("新增：1\n更新：1\n刪除：0"));
+        assert!(body.contains("Rust"));
+        assert!(body.contains("https://www.104.com.tw/job/abc"));
     }
     #[test]
     fn persistence_and_delete_are_transactional() {

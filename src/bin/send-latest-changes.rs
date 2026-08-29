@@ -48,12 +48,33 @@ fn run() -> Result<()> {
         .and_then(|runs| runs.last())
         .context("latest change file contains no runs")?;
     let count = |name: &str| run.get(name).and_then(Value::as_array).map_or(0, Vec::len);
-    let body = format!(
+    let mut body = format!(
         "新增：{}\n更新：{}\n刪除：{}",
         count("new"),
         count("updated"),
         count("deleted")
     );
+    for (key, label) in [
+        ("new", "新增職缺"),
+        ("updated", "更新職缺"),
+        ("deleted", "刪除職缺"),
+    ] {
+        let Some(jobs) = run.get(key).and_then(Value::as_array) else {
+            continue;
+        };
+        if jobs.is_empty() {
+            continue;
+        }
+        body.push_str(&format!("\n\n{label}:"));
+        for job in jobs {
+            let title = job
+                .get("title")
+                .and_then(Value::as_str)
+                .unwrap_or("(無標題)");
+            let url = job.get("url").and_then(Value::as_str).unwrap_or("(無網址)");
+            body.push_str(&format!("\n{title}\n{url}"));
+        }
+    }
     let username =
         std::env::var("GMAIL_SMTP_USERNAME").context("GMAIL_SMTP_USERNAME is required")?;
     let password =
