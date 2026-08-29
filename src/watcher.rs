@@ -81,6 +81,7 @@ pub struct ChangeRecord {
     pub company: String,
     pub location: Option<String>,
     pub salary: Option<String>,
+    pub published_at: Option<String>,
     pub url: String,
     #[serde(default = "default_fetch_state")]
     pub fetch_state: String,
@@ -660,7 +661,7 @@ fn ensure_schema(connection: &Connection) -> Result<()> {
         }
     }
     connection.execute(
-        "UPDATE jobs SET first_seen_at=COALESCE(NULLIF(first_seen_at,''),published_at,CURRENT_TIMESTAMP), last_seen_at=COALESCE(NULLIF(last_seen_at,''),CURRENT_TIMESTAMP), seen_count=COALESCE(NULLIF(seen_count,0),1)",
+        "UPDATE jobs SET first_seen_at=COALESCE(NULLIF(first_seen_at,''),CURRENT_TIMESTAMP), last_seen_at=COALESCE(NULLIF(last_seen_at,''),CURRENT_TIMESTAMP), seen_count=COALESCE(NULLIF(seen_count,0),1)",
         [],
     )?;
     Ok(())
@@ -772,7 +773,6 @@ fn copy_tracking(target: &mut JobListing, persisted: &JobListing) {
 fn apply_run_tracking(job: &mut JobListing, old: Option<&JobListing>, run_at: &str) {
     job.first_seen_at = old
         .and_then(|previous| previous.first_seen_at.clone())
-        .or_else(|| job.published_at.clone())
         .or_else(|| Some(run_at.to_owned()));
     job.last_seen_at = Some(run_at.to_owned());
     job.seen_count = old
@@ -794,6 +794,7 @@ fn change_record(
         company: job.company.clone(),
         location: job.location.clone(),
         salary: job.salary.clone(),
+        published_at: job.published_at.clone(),
         url: job.url.clone(),
         fetch_state: job.fetch_state.clone(),
         changed_fields: fields,
@@ -818,7 +819,7 @@ fn persist_state(
         .transaction()
         .context("failed to begin SQLite state transaction")?;
     {
-        let mut statement = tx.prepare("INSERT INTO jobs(source,external_id,title,company,location,salary,description,url,published_at,platform_updated_at,fetch_state,work_site,annual_salary,last_updated,first_seen_at,last_seen_at,seen_count) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?5,?6,COALESCE(?10,?9),COALESCE(?9,?12),?12,1) ON CONFLICT(source,external_id) DO UPDATE SET title=excluded.title,company=excluded.company,location=excluded.location,salary=excluded.salary,description=COALESCE(excluded.description,jobs.description),url=excluded.url,published_at=excluded.published_at,platform_updated_at=excluded.platform_updated_at,fetch_state=excluded.fetch_state,work_site=excluded.work_site,annual_salary=excluded.annual_salary,last_updated=excluded.last_updated,first_seen_at=COALESCE(jobs.first_seen_at,excluded.first_seen_at),last_seen_at=excluded.last_seen_at,seen_count=COALESCE(jobs.seen_count,0)+1")?;
+        let mut statement = tx.prepare("INSERT INTO jobs(source,external_id,title,company,location,salary,description,url,published_at,platform_updated_at,fetch_state,work_site,annual_salary,last_updated,first_seen_at,last_seen_at,seen_count) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?5,?6,COALESCE(?10,?9),?12,?12,1) ON CONFLICT(source,external_id) DO UPDATE SET title=excluded.title,company=excluded.company,location=excluded.location,salary=excluded.salary,description=COALESCE(excluded.description,jobs.description),url=excluded.url,published_at=excluded.published_at,platform_updated_at=excluded.platform_updated_at,fetch_state=excluded.fetch_state,work_site=excluded.work_site,annual_salary=excluded.annual_salary,last_updated=excluded.last_updated,first_seen_at=COALESCE(jobs.first_seen_at,excluded.first_seen_at),last_seen_at=excluded.last_seen_at,seen_count=COALESCE(jobs.seen_count,0)+1")?;
         let mut persisted_ids = HashSet::new();
         for job in jobs {
             if !persisted_ids.insert(job.external_id.clone()) {
@@ -1719,7 +1720,7 @@ mod tests {
     }
 
     #[test]
-    fn seen_tracking_uses_published_time_and_counts_distinct_runs() {
+    fn seen_tracking_uses_first_observation_time_and_counts_distinct_runs() {
         let mut c = Connection::open_in_memory().unwrap();
         let mut job = sample();
         job.published_at = Some("2026-08-20T00:00:00+08:00".into());
@@ -1737,7 +1738,7 @@ mod tests {
         assert_eq!(
             tracking(&c, SOURCE, &job.external_id),
             (
-                "2026-08-20T00:00:00+08:00".into(),
+                "2026-08-23T07:00:00+08:00".into(),
                 "2026-08-23T07:00:00+08:00".into(),
                 1
             )
@@ -1755,7 +1756,7 @@ mod tests {
         assert_eq!(
             tracking(&c, SOURCE, &job.external_id),
             (
-                "2026-08-20T00:00:00+08:00".into(),
+                "2026-08-23T07:00:00+08:00".into(),
                 "2026-08-25T07:00:00+08:00".into(),
                 2
             )
@@ -1803,7 +1804,7 @@ mod tests {
             .unwrap();
         ensure_schema(&c).unwrap();
         let state = tracking(&c, "linkedin", "legacy");
-        assert_eq!(state.0, "2026-08-20");
+        assert!(!state.0.is_empty());
         assert!(!state.1.is_empty());
         assert_eq!(state.2, 1);
     }
@@ -1844,6 +1845,7 @@ mod tests {
         assert!(json.contains("description"));
         assert!(json.contains("2026-08-16T14:30:00+08:00"));
         assert!(json.contains("2026-08-20T00:00:00+08:00"));
+        assert!(json.contains("\"published_at\":\"8/16\""));
         assert!(json.contains("\"seen_count\":2"));
         assert_eq!(
             serde_json::from_str::<ChangeHistory>(&json)
