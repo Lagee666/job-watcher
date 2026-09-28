@@ -17,7 +17,7 @@ use std::{
     thread,
     time::{Duration, SystemTime},
 };
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 const SEARCH_URL: &str =
     "https://www.104.com.tw/jobs/search/?jobsource=index_s&keyword=Rust&mode=s&order=16";
@@ -576,13 +576,67 @@ fn extract_total_pages(tab: &Tab) -> Result<usize> {
 
 struct TabCleanup {
     tab: Arc<Tab>,
+    closed: bool,
+    label: &'static str,
+}
+
+impl TabCleanup {
+    fn new(tab: Arc<Tab>, label: &'static str) -> Self {
+        Self {
+            tab,
+            closed: false,
+            label,
+        }
+    }
+
+    fn close(&mut self) -> Result<()> {
+        if self.closed {
+            return Ok(());
+        }
+        close_target_result(self.tab.close_target(), self.label)?;
+        self.closed = true;
+        info!(target_id = ?self.tab.get_target_id(), label = self.label, "Chromium page closed");
+        Ok(())
+    }
 }
 
 impl Drop for TabCleanup {
     fn drop(&mut self) {
-        if let Err(error) = self.tab.close_target() {
-            debug!(error = %error, "failed to close Chromium page");
+        if self.closed {
+            return;
         }
+        match self.tab.close_target() {
+            Ok(true) => {
+                warn!(
+                    target_id = ?self.tab.get_target_id(),
+                    label = self.label,
+                    "Chromium page closed by cleanup fallback"
+                );
+            }
+            Ok(false) => {
+                warn!(
+                    target_id = ?self.tab.get_target_id(),
+                    label = self.label,
+                    "Chromium returned false while closing page in cleanup fallback"
+                );
+            }
+            Err(error) => {
+                error!(
+                    target_id = ?self.tab.get_target_id(),
+                    label = self.label,
+                    error = %error,
+                    "Failed to close Chromium page in cleanup fallback"
+                );
+            }
+        }
+    }
+}
+
+fn close_target_result(result: Result<bool>, label: &str) -> Result<()> {
+    match result {
+        Ok(true) => Ok(()),
+        Ok(false) => anyhow::bail!("Chromium returned false while closing {label}"),
+        Err(error) => Err(error).with_context(|| format!("failed to close Chromium {label}")),
     }
 }
 
@@ -592,6 +646,8 @@ fn extract_detail(browser: &Browser, job: &JobListing) -> Result<String> {
     let tab = browser
         .new_tab()
         .context("failed to create Chromium JD detail tab")?;
+    let mut tab_cleanup = TabCleanup::new(Arc::clone(&tab), "JD detail tab");
+    info!(target_id = ?tab.get_target_id(), external_id = %job.external_id, "Chromium JD detail tab created");
     let result = (|| {
         tab.navigate_to(&job.url)
             .with_context(|| format!("failed to navigate to JD {}", job.external_id))?
@@ -631,10 +687,21 @@ fn extract_detail(browser: &Browser, job: &JobListing) -> Result<String> {
             .trim()
             .to_owned())
     })();
-    if let Err(error) = tab.close_target() {
-        debug!(external_id = %job.external_id, error = %error, "failed to close JD detail tab");
+    let cleanup_result = tab_cleanup.close();
+    match (result, cleanup_result) {
+        (Ok(description), Ok(())) => Ok(description),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(_), Err(error)) => Err(error),
+        (Err(error), Err(cleanup_error)) => {
+            error!(
+                external_id = %job.external_id,
+                error = %cleanup_error,
+                original_error = %error,
+                "JD detail tab close failed; preserving JD extraction error"
+            );
+            Err(error)
+        }
     }
-    result
 }
 
 fn ensure_schema(connection: &Connection) -> Result<()> {
@@ -1205,9 +1272,8 @@ fn synchronize_104_and_linkedin(
     let detail_browser = Browser::connect(web_socket_debugger_url)
         .context("failed to connect to Chromium for JD details")?;
     let tab = browser.new_tab().context("failed to create Chromium tab")?;
-    let _tab_cleanup = TabCleanup {
-        tab: Arc::clone(&tab),
-    };
+    let mut tab_cleanup = TabCleanup::new(Arc::clone(&tab), "104 search tab");
+    info!(target_id = ?tab.get_target_id(), "Chromium search tab created");
     tab.navigate_to(SEARCH_URL)?.wait_until_navigated()?;
     let title = tab.get_title()?;
     let html = tab.get_content()?;
@@ -1257,6 +1323,9 @@ fn synchronize_104_and_linkedin(
     }
     let total_jobs = search_jobs.len();
     info!(total_jobs, "104 search result set collected");
+    tab_cleanup
+        .close()
+        .context("failed to close Chromium search tab after search collection")?;
     let mut job_writer = match JobFileWriter::new(date, &generated_at) {
         Ok(writer) => Some(writer),
         Err(error) => {
@@ -1904,6 +1973,13 @@ mod tests {
     fn challenge_pages_are_rejected() {
         assert!(is_challenge_page("Just a moment...", "challenge-platform"));
         assert!(!is_challenge_page("104", "data-job-no=abc"));
+    }
+
+    #[test]
+    fn close_target_result_requires_true_and_reports_false() {
+        assert!(close_target_result(Ok(true), "test tab").is_ok());
+        assert!(close_target_result(Ok(false), "test tab").is_err());
+        assert!(close_target_result(Err(anyhow::anyhow!("close failed")), "test tab").is_err());
     }
 
     #[test]
