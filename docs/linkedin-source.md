@@ -74,8 +74,10 @@ SQLite, change history, or the processed-message state.
 
 New LinkedIn jobs are fetched from their normalized public URL with conservative
 sequential HTTP requests, waiting ten seconds between links. A job ID already
-stored in SQLite reuses its stored normalized record and is not fetched again;
-its seen-tracking values are updated by the watcher. No authentication is sent.
+stored in SQLite with a non-empty description reuses its stored normalized
+record and is not fetched again; its seen-tracking values are updated by the
+watcher. Stored records without a description are fetched again for enrichment.
+No authentication is sent.
 The parser first checks `JobPosting`
 JSON-LD, then stable metadata/description structures such as `og:title`,
 `show-more-less-html__markup`, `description__text`, and

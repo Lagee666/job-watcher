@@ -72,9 +72,10 @@ empty date folders older than seven days are removed. Set
 date-folder and 10-JD batch layout as the one-shot updater.
 
 Use `cargo run --release` for an optimized build. The process starts an Axum
-health server on `http://127.0.0.1:3004/` by default and runs the watcher immediately,
-then every day at 06:30 Asia/Taipei. The service also performs one
-synchronization when it starts:
+health server on `http://127.0.0.1:3004/` by default and runs the watcher
+immediately by default, then every day at 06:30 Asia/Taipei. Set
+`JOB_WATCHER_SYNC_ON_STARTUP=false` to skip the immediate startup
+synchronization:
 
 ```bash
 curl http://127.0.0.1:3004/

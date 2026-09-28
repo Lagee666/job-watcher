@@ -105,11 +105,15 @@ impl LinkedInAlertSource {
         // rather than Gmail message state, determines whether detail fetching
         // is needed and lets known jobs update their seen counters.
         let (alerts, processed_message_ids) = self.discover(false)?;
-        let unknown_alerts = alerts
+        let fetch_alerts = alerts
             .iter()
-            .filter(|alert| !known.contains_key(&alert.id))
+            .filter(|alert| {
+                known
+                    .get(&alert.id)
+                    .is_none_or(|job| !has_complete_description(job))
+            })
             .count();
-        let client = if unknown_alerts > 0 {
+        let client = if fetch_alerts > 0 {
             Some(
                 Client::builder()
                     .timeout(Duration::from_secs(30))
@@ -123,7 +127,9 @@ impl LinkedInAlertSource {
         let mut jobs = Vec::with_capacity(alerts.len());
         let mut fetched = 0;
         for alert in alerts {
-            if let Some(existing) = known.get(&alert.id) {
+            if let Some(existing) = known.get(&alert.id)
+                && has_complete_description(existing)
+            {
                 info!(
                     job_id = %alert.id,
                     url = %alert.url,
@@ -131,6 +137,13 @@ impl LinkedInAlertSource {
                 );
                 jobs.push(existing.clone());
                 continue;
+            }
+            if known.contains_key(&alert.id) {
+                info!(
+                    job_id = %alert.id,
+                    url = %alert.url,
+                    "LinkedIn job exists without a complete description; fetching detail page"
+                );
             }
             if fetched > 0 {
                 thread::sleep(Duration::from_secs(10));
@@ -151,6 +164,12 @@ impl LinkedInAlertSource {
             allow_deletions: false,
         })
     }
+}
+
+fn has_complete_description(job: &JobListing) -> bool {
+    job.description
+        .as_deref()
+        .is_some_and(|description| !description.trim().is_empty())
 }
 
 impl JobSource for LinkedInAlertSource {

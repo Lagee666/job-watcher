@@ -16,7 +16,8 @@ is history/export only and is never used as current state.
 ## Runtime paths
 
 Axum and the in-process scheduler share a `Service`. The scheduler waits for
-startup and then the next `06:30 Asia/Taipei` instant. Webhook
+startup (when `JOB_WATCHER_SYNC_ON_STARTUP` is enabled) and then the next
+`06:30 Asia/Taipei` instant. Webhook
 handling recognizes `更新JD` and `今日履歷`. Browser, Gmail API, SQLite, filesystem,
 SMTP, and LINE calls run on blocking threads rather than Tokio executor
 threads.
@@ -33,9 +34,11 @@ contact 104.
    cannot cause mass deletions. LinkedIn deletion comparison is source-scoped.
 3. Normalize both sources into the same Job model and deduplicate LinkedIn
    results by `(source, external_id)`.
-   LinkedIn IDs already stored in SQLite reuse their stored normalized record;
-   they do not trigger another detail-page HTTP request. Their seen-tracking
-   fields are updated and they remain eligible for the combined Updated report.
+   LinkedIn IDs already stored in SQLite with a complete description reuse their
+   stored normalized record and do not trigger another detail-page HTTP request.
+   Their seen-tracking fields are updated and they remain eligible for the
+   combined Updated report. Stored records without a description are fetched
+   again for enrichment.
 4. Compare `(source, external_id)` and normalized meaningful fields.
 5. Commit all source upserts and safe deletions in the shared SQLite table.
 6. Append one combined run to today's history JSON.

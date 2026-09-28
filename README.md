@@ -12,8 +12,10 @@ controls.
 Axum listens on port `3004` by default and accepts `POST /webhook`. Browser,
 SQLite, filesystem, SMTP, and LINE work runs off the Tokio executor.
 
-The service synchronizes all enabled sources once at startup and automatically every day at
-`06:30 Asia/Taipei`. Automatic `17:00` and `21:30` runs are removed.
+The service synchronizes all enabled sources once at startup by default and
+automatically every day at `06:30 Asia/Taipei`. Set
+`JOB_WATCHER_SYNC_ON_STARTUP=false` to skip the immediate startup run.
+Automatic `17:00` and `21:30` runs are removed.
 
 LINE commands:
 
@@ -64,11 +66,12 @@ parsing, public-page mapping, and failure safety. Set `LINKEDIN_ENABLED=true`,
 provide `GMAIL_OAUTH_CLIENT_FILE` and `GMAIL_OAUTH_TOKEN_FILE`, and configure
 `LINKEDIN_GMAIL_QUERY` if the default search is not suitable.
 
-During synchronization, LinkedIn IDs already present in SQLite are reused
-without another public-page HTTP request. Their `last_seen_at` and `seen_count`
-are updated, and they are included as updated jobs in the combined change
-history, Gmail summary, and `job-list.json`. Only newly discovered LinkedIn IDs
-need detail-page fetching.
+During synchronization, LinkedIn IDs already present in SQLite with a complete
+description are reused without another public-page HTTP request. Their
+`last_seen_at` and `seen_count` are updated, and they are included as updated
+jobs in the combined change history, Gmail summary, and `job-list.json`.
+Stored IDs without a description are fetched again so their JD can be completed.
+Only newly discovered or incomplete LinkedIn IDs need detail-page fetching.
 
 Search cards provide summary fields. New and known jobs are opened in a second
 normal Chromium tab and the complete visible detail text is extracted. A detail

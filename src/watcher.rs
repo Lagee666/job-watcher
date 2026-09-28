@@ -1589,9 +1589,34 @@ fn mime_message(
 ) -> String {
     let boundary = "job-watcher-attachment";
     let encoded_subject = format!("=?UTF-8?B?{}?=", STANDARD.encode(subject.as_bytes()));
+    let encoded_attachment = STANDARD.encode(attachment);
+
     format!(
-        "To: {recipient}\r\nSubject: {encoded_subject}\r\nMIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=\"{boundary}\"\r\n\r\n--{boundary}\r\nContent-Type: text/plain; charset=UTF-8\r\nContent-Transfer-Encoding: 8bit\r\n\r\n{body}\r\n--{boundary}\r\nContent-Type: application/json; name=\"{filename}\"\r\nContent-Disposition: attachment; filename=\"{filename}\"\r\nContent-Transfer-Encoding: base64\r\n\r\n{}\r\n--{boundary}--\r\n",
-        STANDARD.encode(attachment)
+        concat!(
+            "To: {recipient}\r\n",
+            "Subject: {encoded_subject}\r\n",
+            "MIME-Version: 1.0\r\n",
+            "Content-Type: multipart/mixed; boundary=\"{boundary}\"\r\n",
+            "\r\n",
+            "--{boundary}\r\n",
+            "Content-Type: text/plain; charset=UTF-8\r\n",
+            "Content-Transfer-Encoding: 8bit\r\n",
+            "\r\n",
+            "{body}\r\n",
+            "--{boundary}\r\n",
+            "Content-Type: application/json; charset=UTF-8; name=\"{filename}\"\r\n",
+            "Content-Disposition: attachment; filename=\"{filename}\"\r\n",
+            "Content-Transfer-Encoding: base64\r\n",
+            "\r\n",
+            "{encoded_attachment}\r\n",
+            "--{boundary}--\r\n",
+        ),
+        recipient = recipient,
+        encoded_subject = encoded_subject,
+        boundary = boundary,
+        body = body,
+        filename = filename,
+        encoded_attachment = encoded_attachment,
     )
 }
 
@@ -1667,9 +1692,13 @@ fn next_scheduled_run() -> Result<Duration> {
 }
 
 pub fn run_service(service: Service) -> Result<()> {
-    info!("running startup synchronization; automatic schedule is 06:30 Asia/Taipei");
-    if let Err(error) = service.try_synchronize("startup") {
-        error!(error = %error, "startup synchronization failed");
+    if startup_sync_enabled() {
+        info!("running startup synchronization; automatic schedule is 06:30 Asia/Taipei");
+        if let Err(error) = service.try_synchronize("startup") {
+            error!(error = %error, "startup synchronization failed");
+        }
+    } else {
+        info!("startup synchronization disabled; automatic schedule is 06:30 Asia/Taipei");
     }
     loop {
         let delay = next_scheduled_run()?;
@@ -1682,6 +1711,18 @@ pub fn run_service(service: Service) -> Result<()> {
             error!(error = %error, "scheduled synchronization failed");
         }
     }
+}
+
+fn startup_sync_enabled() -> bool {
+    std::env::var("JOB_WATCHER_SYNC_ON_STARTUP")
+        .ok()
+        .map(|value| {
+            matches!(
+                value.to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(true)
 }
 
 #[cfg(test)]
