@@ -543,9 +543,9 @@ fn extract_job_list(tab: &Tab) -> Result<Vec<JobListing>> {
     let result = tab.evaluate(r#"(async () => {
         const jobs = new Map(); const text = (root, selector) => { const v = root.querySelector(selector)?.innerText?.trim(); return v || null; };
         const collect = () => { for (const card of document.querySelectorAll('div[data-job-no]')) {
-            const id = card.getAttribute('data-job-no'); const anchor = card.querySelector('a.info-job'); if (!id || !anchor) continue;
+            const id = card.getAttribute('data-job-no'); const anchor = card.querySelector('a.info-job__text, a.info-job'); if (!id || !anchor) continue;
             let url = anchor.href; try { url = new URL(url).searchParams.get('url') || url; } catch (_) {}
-            jobs.set(id, { external_id:id, title:text(card,'.info-name') || '', company:text(card,'.info-company > a') || '', location:text(card,'[data-gtm-joblist^="職缺-地區"]'), salary:text(card,'[data-gtm-joblist^="職缺-薪資"]'), description:text(card,'.info-content'), url, published_at:text(card,'.job-mobile__date') });
+            jobs.set(id, { external_id:id, title:text(card,'a.info-job__text, .info-name') || anchor.innerText.trim(), company:text(card,'a.info-company__text, .info-company > a') || '', location:text(card,'[data-gtm-joblist^="職缺-地區"]'), salary:text(card,'[data-gtm-joblist^="職缺-薪資"]'), description:text(card,'.info-content'), url, published_at:text(card,'.job-mobile__date') });
         }};
         const scroller = document.querySelector('.vue-recycle-scroller'); for (let i=0;i<120;i++) { collect(); if (!scroller) break; const old=scroller.scrollTop; scroller.scrollTop += Math.max(window.innerHeight,600); scroller.dispatchEvent(new Event('scroll',{bubbles:true})); await new Promise(r=>setTimeout(r,100)); if (scroller.scrollTop === old) break; } collect(); return JSON.stringify([...jobs.values()]);
     })()"#, true)?;
