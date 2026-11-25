@@ -46,6 +46,26 @@ chromium --remote-debugging-port=9222 \
 If the executable is named `chromium-browser`, use that name instead. Leave
 Chromium running while the watcher is running.
 
+On a Pi without a desktop, use headless Chromium instead:
+
+```bash
+chromium --headless --remote-debugging-address=127.0.0.1 \
+  --remote-debugging-port=9222 --user-data-dir=/tmp/job-watcher-chromium
+```
+
+Before starting an update, verify CDP from the same host/container as the
+watcher in a second terminal:
+
+```bash
+curl -fsS http://127.0.0.1:9222/json/version
+```
+
+The JSON must contain `webSocketDebuggerUrl`. If it fails, check that Chromium
+stayed running and that port 9222 belongs to the browser. In a container,
+`127.0.0.1` refers to that container. Set `JOB_WATCHER_CDP_URL` to the reachable
+browser `/json/version` endpoint when needed. Its returned WebSocket address
+must also be reachable by the watcher. The watcher does not launch Chromium.
+
 In a second terminal, start the service:
 
 ```bash

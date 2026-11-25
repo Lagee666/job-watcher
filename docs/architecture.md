@@ -89,3 +89,9 @@ previously valid description, indicating that the current refresh failed.
 Successful retrieval clears the error. 104 detail scheduling explicitly retries
 missing descriptions and failed refreshes on the next cycle; summary-card
 `MetadataOnly` states do not force an otherwise unchanged complete JD to reload.
+
+LinkedIn detail acquisition returns an internal outcome indicating whether an
+HTTP/access-wall restriction should stop the current batch. That platform
+decision stays in the source module. Remaining identities remain available as
+metadata, and cached complete jobs remain reusable. This is not a durable retry
+queue or a cross-run cooldown.

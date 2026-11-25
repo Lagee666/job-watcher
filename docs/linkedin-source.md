@@ -120,6 +120,17 @@ HTML, missing descriptions, and parser changes are recorded as per-job fetch
 failures. Requests are sequential with a short delay; there is no aggressive
 crawler or tight retry loop.
 
+HTTP 401, 403, 429, and nonstandard 999 responses, plus successful redirects to
+a login/access wall, stop all further public-page requests for that
+synchronization. The triggering job retains `FetchFailed`; remaining jobs that
+need enrichment retain their alert metadata with `MetadataOnly` and an explicit
+deferred-request reason. Complete cached records continue to be reused, and no
+discovered identities are discarded. HTTP 404 and ordinary per-job parse
+failures do not stop unrelated jobs. `Retry-After` is recorded in the diagnostic
+when supplied. This guard is per synchronization; it does not persist cooldown
+state across restarts or guarantee that a later run will have access. Avoid
+repeated manual runs while LinkedIn is rejecting requests.
+
 Alert discovery is additive evidence, not a complete LinkedIn inventory.
 LinkedIn snapshots therefore never delete missing rows. Existing LinkedIn
 rows are preserved when Gmail fails, OAuth expires, a message is malformed, or

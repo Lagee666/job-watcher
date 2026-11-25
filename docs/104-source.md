@@ -465,3 +465,11 @@ previous JD but set `fetch_state=FetchFailed` and preserve the error chain in
 `fetch_error`. Success sets `Complete` and clears the error. Previously stored
 legacy descriptions are not automatically revalidated; use `update-jobs-all`
 to check all current 104 listings with the stricter extraction rules.
+
+The browser must already be running and reachable from the watcher process.
+`JOB_WATCHER_CDP_URL` defaults to `http://127.0.0.1:9222/json/version` and may
+point to another browser version endpoint. Discovery has a five-second HTTP
+timeout; connection failures include the endpoint and a Chromium startup hint.
+A version-endpoint failure is a local/browser connectivity issue, not evidence
+that 104 rejected a request. When LinkedIn fallback runs, this original error
+is logged immediately at warning level with its full cause chain.

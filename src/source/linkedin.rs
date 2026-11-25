@@ -24,6 +24,11 @@ struct AlertJob {
     location: Option<String>,
 }
 
+struct DetailFetch {
+    job: JobListing,
+    stop_detail_requests: bool,
+}
+
 #[derive(Default)]
 struct LinkedInHeader {
     job_id: Option<String>,
@@ -124,36 +129,17 @@ impl LinkedInAlertSource {
         } else {
             None
         };
-        let mut jobs = Vec::with_capacity(alerts.len());
-        let mut fetched = 0;
-        for alert in alerts {
-            if let Some(existing) = known.get(&alert.id)
-                && has_complete_description(existing)
-            {
-                info!(
-                    job_id = %alert.id,
-                    url = %alert.url,
-                    "LinkedIn job already exists in SQLite; updating seen tracking without HTTP fetch"
-                );
-                jobs.push(existing.clone());
-                continue;
-            }
-            if known.contains_key(&alert.id) {
-                info!(
-                    job_id = %alert.id,
-                    url = %alert.url,
-                    "LinkedIn job exists without a complete description; fetching detail page"
-                );
-            }
-            if fetched > 0 {
-                thread::sleep(Duration::from_secs(10));
-            }
-            fetched += 1;
-            let client = client
-                .as_ref()
-                .context("missing LinkedIn public-page client")?;
-            jobs.push(fetch_job(client, alert));
-        }
+        let jobs = acquire_alert_jobs(
+            alerts,
+            known,
+            |alert| {
+                let client = client
+                    .as_ref()
+                    .context("missing LinkedIn public-page client")?;
+                Ok(fetch_job(client, alert))
+            },
+            thread::sleep,
+        )?;
         if jobs.iter().all(|job| job.fetch_state == "Complete") {
             record_processed_messages(&processed_message_file(), &processed_message_ids)?;
         }
@@ -164,6 +150,55 @@ impl LinkedInAlertSource {
             allow_deletions: false,
         })
     }
+}
+
+fn acquire_alert_jobs(
+    alerts: Vec<AlertJob>,
+    known: &std::collections::HashMap<String, JobListing>,
+    mut fetch: impl FnMut(AlertJob) -> Result<DetailFetch>,
+    mut delay: impl FnMut(Duration),
+) -> Result<Vec<JobListing>> {
+    let mut jobs = Vec::with_capacity(alerts.len());
+    let mut fetched = 0;
+    let mut deferred_reason = None;
+    for alert in alerts {
+        if let Some(existing) = known.get(&alert.id)
+            && has_complete_description(existing)
+        {
+            info!(
+                job_id = %alert.id,
+                url = %alert.url,
+                "LinkedIn job already exists in SQLite; updating seen tracking without HTTP fetch"
+            );
+            jobs.push(existing.clone());
+            continue;
+        }
+        if let Some(reason) = deferred_reason.as_deref() {
+            jobs.push(metadata_only(alert, "MetadataOnly", reason));
+            continue;
+        }
+        if known.contains_key(&alert.id) {
+            info!(
+                job_id = %alert.id,
+                url = %alert.url,
+                "LinkedIn job exists without a complete description; fetching detail page"
+            );
+        }
+        if fetched > 0 {
+            delay(Duration::from_secs(10));
+        }
+        fetched += 1;
+        let result = fetch(alert)?;
+        if result.stop_detail_requests {
+            deferred_reason = Some(format!(
+                "detail request deferred for this synchronization after LinkedIn restricted access: {}; no request was sent for this job",
+                result.job.fetch_error.as_deref().unwrap_or("access denied")
+            ));
+            tracing::warn!(detail = ?result.job.fetch_error, "LinkedIn restricted access; stopping remaining public-page requests for this synchronization");
+        }
+        jobs.push(result.job);
+    }
+    Ok(jobs)
 }
 
 fn has_complete_description(job: &JobListing) -> bool {
@@ -209,13 +244,14 @@ fn record_processed_messages(path: &std::path::Path, ids: &[String]) -> Result<(
     Ok(())
 }
 
-fn fetch_job(client: &Client, alert: AlertJob) -> JobListing {
+fn fetch_job(client: &Client, alert: AlertJob) -> DetailFetch {
     debug!(
         job_id = %alert.id,
         url = %alert.url,
         "Fetching LinkedIn job detail"
     );
-    match client.get(&alert.url).send() {
+    let mut stop_detail_requests = false;
+    let job = match client.get(&alert.url).send() {
         Ok(response) if response.status().is_success() => {
             let status = response.status();
             let final_url = response.url().to_string();
@@ -224,11 +260,14 @@ fn fetch_job(client: &Client, alert: AlertJob) -> JobListing {
                 Some("authwall" | "login" | "checkpoint")
             ) || response.url().path().starts_with("/uas/login")
             {
-                return metadata_only(
-                    alert,
-                    "FetchFailed",
-                    &format!("login or access wall; HTTP {status}; final_url={final_url}"),
-                );
+                return DetailFetch {
+                    job: metadata_only(
+                        alert,
+                        "FetchFailed",
+                        &format!("login or access wall; HTTP {status}; final_url={final_url}"),
+                    ),
+                    stop_detail_requests: true,
+                };
             }
             match response.text() {
                 Ok(html) => {
@@ -262,6 +301,7 @@ fn fetch_job(client: &Client, alert: AlertJob) -> JobListing {
             }
         }
         Ok(response) => {
+            stop_detail_requests = matches!(response.status().as_u16(), 401 | 403 | 429 | 999);
             let state = if response.status().as_u16() == 404 {
                 "Removed"
             } else {
@@ -270,7 +310,16 @@ fn fetch_job(client: &Client, alert: AlertJob) -> JobListing {
             metadata_only(
                 alert,
                 state,
-                &format!("HTTP {}; final_url={}", response.status(), response.url()),
+                &format!(
+                    "HTTP {}; final_url={}; retry_after={}",
+                    response.status(),
+                    response.url(),
+                    response
+                        .headers()
+                        .get(reqwest::header::RETRY_AFTER)
+                        .and_then(|value| value.to_str().ok())
+                        .unwrap_or("not provided")
+                ),
             )
         }
         Err(error) => {
@@ -285,6 +334,10 @@ fn fetch_job(client: &Client, alert: AlertJob) -> JobListing {
             };
             metadata_only(alert, "FetchFailed", &format!("{kind} failure: {error:?}"))
         }
+    };
+    DetailFetch {
+        job,
+        stop_detail_requests,
     }
 }
 
@@ -1045,8 +1098,9 @@ fn strip_ui_suffix(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        AlertJob, canonical_linkedin_url, enrich_from_html, enrich_from_html_at,
-        extract_alert_jobs, fetch_job, parse_linkedin_header,
+        AlertJob, DetailFetch, acquire_alert_jobs, alert_metadata, canonical_linkedin_url,
+        enrich_from_html, enrich_from_html_at, extract_alert_jobs, fetch_job, metadata_only,
+        parse_linkedin_header,
     };
     use crate::watcher::JobListing;
     use reqwest::blocking::Client;
@@ -1054,6 +1108,10 @@ mod tests {
     use tokio::fs;
 
     fn fetch_mock_responses(responses: Vec<String>) -> JobListing {
+        fetch_mock_outcome(responses).job
+    }
+
+    fn fetch_mock_outcome(responses: Vec<String>) -> DetailFetch {
         use std::io::{Read, Write};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
@@ -1103,12 +1161,15 @@ mod tests {
     #[test]
     fn http_failures_preserve_status_url_and_alert_metadata() {
         for status in [
+            "401 Unauthorized",
             "403 Forbidden",
             "429 Too Many Requests",
             "999 Request Denied",
             "404 Not Found",
         ] {
-            let job = fetch_mock_responses(vec![mock_response(status, "unavailable")]);
+            let result = fetch_mock_outcome(vec![mock_response(status, "unavailable")]);
+            assert_eq!(result.stop_detail_requests, !status.starts_with("404"));
+            let job = result.job;
             assert_eq!(
                 job.fetch_state,
                 if status.starts_with("404") {
@@ -1164,6 +1225,25 @@ mod tests {
     }
 
     #[test]
+    fn rate_limit_diagnostic_preserves_retry_after_header() {
+        let response = mock_response("429 Too Many Requests", "").replacen(
+            "\r\n",
+            "\r\nRetry-After: 120\r\n",
+            1,
+        );
+        let result = fetch_mock_outcome(vec![response]);
+        assert!(result.stop_detail_requests);
+        assert!(
+            result
+                .job
+                .fetch_error
+                .as_deref()
+                .unwrap()
+                .contains("retry_after=120")
+        );
+    }
+
+    #[test]
     fn successful_jd_response_has_no_fetch_error() {
         let job = fetch_mock_responses(vec![mock_response(
             "200 OK",
@@ -1171,6 +1251,77 @@ mod tests {
         )]);
         assert_eq!(job.fetch_state, "Complete");
         assert!(job.fetch_error.is_none());
+    }
+
+    fn test_alert(id: &str) -> AlertJob {
+        AlertJob {
+            id: id.into(),
+            url: format!("https://www.linkedin.com/jobs/view/{id}/"),
+            title: format!("Role {id}"),
+            company: "Company".into(),
+            location: None,
+        }
+    }
+
+    #[test]
+    fn access_restriction_stops_batch_without_losing_alerts_or_cached_jobs() {
+        let mut cached = alert_metadata(test_alert("cached"));
+        cached.description = Some("Previously saved complete JD".into());
+        cached.fetch_state = "Complete".into();
+        let known = std::collections::HashMap::from([("cached".into(), cached.clone())]);
+        let mut requests = 0;
+        let jobs = acquire_alert_jobs(
+            vec![
+                test_alert("first"),
+                test_alert("second"),
+                test_alert("cached"),
+            ],
+            &known,
+            |alert| {
+                requests += 1;
+                Ok(DetailFetch {
+                    job: metadata_only(alert, "FetchFailed", "HTTP 429 Too Many Requests"),
+                    stop_detail_requests: true,
+                })
+            },
+            |_| panic!("no sleep or request should follow the first restriction"),
+        )
+        .unwrap();
+        assert_eq!(requests, 1);
+        assert_eq!(jobs.len(), 3);
+        assert_eq!(jobs[0].fetch_state, "FetchFailed");
+        assert_eq!(jobs[1].fetch_state, "MetadataOnly");
+        assert_eq!(jobs[1].title, "Role second");
+        assert!(
+            jobs[1]
+                .fetch_error
+                .as_deref()
+                .unwrap()
+                .contains("no request was sent")
+        );
+        assert_eq!(jobs[2], cached);
+    }
+
+    #[test]
+    fn removed_job_does_not_stop_remaining_details_and_requests_remain_spaced() {
+        let mut requests = 0;
+        let mut waits = Vec::new();
+        let jobs = acquire_alert_jobs(
+            vec![test_alert("removed"), test_alert("next")],
+            &std::collections::HashMap::new(),
+            |alert| {
+                requests += 1;
+                Ok(DetailFetch {
+                    job: metadata_only(alert, "Removed", "HTTP 404 Not Found"),
+                    stop_detail_requests: false,
+                })
+            },
+            |duration| waits.push(duration),
+        )
+        .unwrap();
+        assert_eq!(requests, 2);
+        assert_eq!(jobs.len(), 2);
+        assert_eq!(waits, vec![Duration::from_secs(10)]);
     }
 
     #[test]

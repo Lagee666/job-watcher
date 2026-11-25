@@ -355,7 +355,7 @@ impl LineNotifier {
         }
     }
     fn send_text(&self, text: &str) -> Result<()> {
-        reqwest::blocking::Client::new()
+        let response = reqwest::blocking::Client::new()
             .post("https://api.line.me/v2/bot/message/push")
             .bearer_auth(&self.channel_access_token)
             .json(&LinePushRequest {
@@ -366,13 +366,11 @@ impl LineNotifier {
                 }],
             })
             .send()
-            .context("failed to send LINE notification")?
-            .error_for_status()
-            .context("LINE Messaging API rejected the notification")?;
-        Ok(())
+            .context("failed to send LINE notification")?;
+        check_line_response(response, "notification")
     }
     fn reply_text(&self, reply_token: &str, text: &str) -> Result<()> {
-        reqwest::blocking::Client::new()
+        let response = reqwest::blocking::Client::new()
             .post("https://api.line.me/v2/bot/message/reply")
             .bearer_auth(&self.channel_access_token)
             .json(&LineReplyRequest {
@@ -383,11 +381,38 @@ impl LineNotifier {
                 }],
             })
             .send()
-            .context("failed to reply to LINE webhook")?
-            .error_for_status()
-            .context("LINE Messaging API rejected the webhook reply")?;
-        Ok(())
+            .context("failed to reply to LINE webhook")?;
+        check_line_response(response, "webhook reply")
     }
+}
+
+fn check_line_response(response: reqwest::blocking::Response, operation: &str) -> Result<()> {
+    let status = response.status();
+    if status.is_success() {
+        return Ok(());
+    }
+    let request_id = response
+        .headers()
+        .get("x-line-request-id")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("not provided")
+        .to_owned();
+    let body = response
+        .text()
+        .map(|body| body.chars().take(2048).collect::<String>())
+        .unwrap_or_else(|error| format!("unable to read error response: {error}"));
+    anyhow::bail!(
+        "LINE Messaging API rejected the {operation}: HTTP {status}; request_id={request_id}; response={body}"
+    )
+}
+
+fn chromium_version(endpoint: &str) -> Result<ChromeVersion> {
+    reqwest::blocking::Client::builder().timeout(Duration::from_secs(5)).build()?
+        .get(endpoint).send().with_context(|| format!(
+            "cannot reach Chromium CDP at {endpoint}; start Chromium with --remote-debugging-port=9222, or set JOB_WATCHER_CDP_URL to its /json/version endpoint"
+        ))?
+        .error_for_status().context("Chromium CDP returned an HTTP error")?
+        .json().context("Chromium CDP /json/version did not return a valid browser WebSocket URL")
 }
 
 #[derive(Clone)]
@@ -1189,6 +1214,7 @@ fn synchronize(
             let Ok(Some(linkedin)) = LinkedInAlertSource::from_env() else {
                 return Err(error);
             };
+            warn!(error = %format!("{error:#}"), "104 synchronization failed; attempting LinkedIn fallback");
             let known_linkedin = load_known_linkedin_for_acquisition()?;
             let snapshot = match linkedin.acquire_with_known(&known_linkedin) {
                 Ok(snapshot) => snapshot,
@@ -1201,7 +1227,6 @@ fn synchronize(
                     return Err(error);
                 }
             };
-            info!(error = %error, "104 synchronization failed; continuing with LinkedIn snapshot");
             synchronize_linkedin_only(trigger, notifier, snapshot)
         }
     }
@@ -1333,9 +1358,9 @@ fn synchronize_104_and_linkedin(
         started_at = %generated_at,
         "opening 104 job-list URL"
     );
-    let version: ChromeVersion = reqwest::blocking::get("http://127.0.0.1:9222/json/version")?
-        .error_for_status()?
-        .json()?;
+    let endpoint = std::env::var("JOB_WATCHER_CDP_URL")
+        .unwrap_or_else(|_| "http://127.0.0.1:9222/json/version".into());
+    let version = chromium_version(&endpoint)?;
     let web_socket_debugger_url = version.web_socket_debugger_url.clone();
     let browser = Browser::connect(version.web_socket_debugger_url)
         .context("failed to connect to Chromium")?;
@@ -1835,6 +1860,60 @@ fn startup_sync_enabled() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn mock_response(status: &str, body: &str) -> reqwest::blocking::Response {
+        use std::io::Read;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let response = format!(
+            "HTTP/1.1 {status}\r\nx-line-request-id: fixture-request\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let server = thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut buffer = [0; 1024];
+            assert!(socket.read(&mut buffer).unwrap() > 0);
+            socket.write_all(response.as_bytes()).unwrap();
+        });
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let response = reqwest::blocking::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap()
+            .get(format!("http://{address}/fixture"))
+            .send()
+            .unwrap();
+        server.join().unwrap();
+        response
+    }
+
+    #[test]
+    fn line_error_preserves_status_body_and_request_id() {
+        let response = mock_response("401 Unauthorized", r#"{"message":"Authentication failed"}"#);
+        let error = check_line_response(response, "notification")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("401 Unauthorized"));
+        assert!(error.contains("Authentication failed"));
+        assert!(error.contains("fixture-request"));
+        assert!(check_line_response(mock_response("200 OK", "{}"), "notification").is_ok());
+    }
+
+    #[test]
+    fn missing_chromium_has_endpoint_and_startup_hint() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}/json/version", listener.local_addr().unwrap());
+        drop(listener);
+        let error = chromium_version(&endpoint).err().unwrap().to_string();
+        assert!(error.contains(&endpoint));
+        assert!(error.contains("--remote-debugging-port=9222"));
+        assert!(error.contains("JOB_WATCHER_CDP_URL"));
+    }
 
     #[test]
     fn incremental_fetch_retries_missing_or_failed_descriptions() {

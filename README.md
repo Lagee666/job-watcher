@@ -72,6 +72,12 @@ description are reused without another public-page HTTP request. Their
 jobs in the combined change history, Gmail summary, and `job-list.json`.
 Stored IDs without a description are fetched again so their JD can be completed.
 Only newly discovered or incomplete LinkedIn IDs need detail-page fetching.
+If LinkedIn returns HTTP 401/403/429/999 or redirects to a login/access wall,
+remaining detail requests stop for that synchronization. Unattempted jobs retain
+their alert metadata with `MetadataOnly` and a deferred-request explanation;
+cached complete JDs are still reused. This avoids continuing a blocked batch,
+but does not remove LinkedIn's access restriction or persist a cooldown across
+manual restarts. `Retry-After` is recorded when supplied.
 
 Search cards provide summary fields. New and known jobs are opened in a second
 normal Chromium tab and the complete visible detail text is extracted. A detail
@@ -98,6 +104,14 @@ To capture one update's diagnostic log on the Pi:
 ```bash
 RUST_LOG=job_watcher=debug cargo run --bin update-jobs 2>&1 | tee job-watcher-fetch.log
 ```
+
+If 104 fails at `http://127.0.0.1:9222/json/version`, start Chromium first and
+check that endpoint from the same host/container as the watcher. This failure
+happens before visiting 104. `JOB_WATCHER_CDP_URL` can override the version
+endpoint when the browser runs elsewhere; see [install.md](install.md).
+LINE rejection errors include HTTP status, the response body (up to 2048
+characters), and LINE's request ID, so token, recipient, quota, and other API
+errors can be distinguished without logging request credentials.
 
 SQLite remains the only current-state store. Its identity is `(source,
 external_id)`, and existing databases are migrated in place. Deterministic
