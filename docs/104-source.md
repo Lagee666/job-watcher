@@ -403,11 +403,11 @@ The fields are read from the rendered card using these selectors/attributes:
 | Output field | Rendered source |
 |---|---|
 | `external_id` | `data-job-no` |
-| `title` | `.info-name` |
-| `company` | `.info-company > a` |
+| `title` | `a.info-job__text` or legacy `.info-name`, falling back to the job link text |
+| `company` | `a.info-company__text` or legacy `.info-company > a` |
 | `location` | `[data-gtm-joblist^="職缺-地區"]` |
 | `salary` | `[data-gtm-joblist^="職缺-薪資"]` |
-| `url` | `a.info-job`, unwrapped from the `r.104.com.tw` redirect URL when possible |
+| `url` | `a.info-job__text` or legacy `a.info-job`, unwrapped from the `r.104.com.tw` redirect URL when possible |
 | `published_at` | `.job-mobile__date` |
 | `description` | `.info-content` when present; summary cards may have no description |
 
