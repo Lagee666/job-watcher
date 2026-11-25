@@ -103,6 +103,16 @@ or `ParseFailed`. Metadata-only records retain source, ID, URL, title, and
 company so a failed public page does not crash the entire synchronization or
 erase a previously complete description.
 
+Failure diagnostics are persisted as optional `fetch_error` text in SQLite and
+JSON exports, rather than appearing only in logs. Non-success responses include
+HTTP status and final URL (404 retains the `Removed` state); request failures
+include their error chain and a timeout/connection/redirect/request category.
+HTTP 200 redirects to `/authwall`, `/login`, `/uas/login`, or `/checkpoint`
+are treated as `FetchFailed`. A successful response without a supported description is
+`ParseFailed`, with final URL and body length recorded. Successful extraction
+has no `fetch_error`. No extra retries, browser fallback, credentials, or
+access-control bypasses are introduced.
+
 ## Failure and deletion safety
 
 HTTP errors, 401/403 login walls, 429 rate limits, removed jobs, malformed

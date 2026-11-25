@@ -428,12 +428,15 @@ are protected and undocumented.
 
 The implementation keeps using the normal Chromium/CDP session. Each listing
 is opened in a separate browser tab and rendered text is read from observed
-description-like containers (`job-description` and class names containing
-`description`), falling back to the rendered body text. These are selector
-observations, not an official 104 API contract. New and existing listings are
-eligible on every low-frequency synchronization because `appearDate` is not a
-verified modification timestamp. A failed detail read is logged by external
-ID and the previous complete description is retained. The source does not call
+job-description containers (`.job-description__content`, `.job-description`,
+and IDs/classes containing `job-description`). Generic `article`, broad
+`description` matches, and whole-body fallbacks are not accepted as full JDs.
+These are selector observations, not an official 104 API contract. New
+listings, missing descriptions, failed refreshes, and listings with changed
+summary fields are eligible for detail fetching on a low-frequency
+synchronization. `appearDate` is not a verified modification timestamp. A failed
+detail read is logged by external ID and the previous complete description is
+retained. The source does not call
 the undocumented JSON endpoints directly and does not implement any challenge
 bypass.
 
@@ -447,3 +450,18 @@ number. Batches are flushed to disk after each group of 10 processed JDs under
 the `MM-DD` date folder. Files older than seven days are removed. This optimization can
 miss a JD-only edit when 104 does not change any listing summary field; use the
 full binary when that stronger check is required.
+
+Search cards are metadata only. After navigation, each search page waits up to
+30 seconds for a rendered card link; detail extraction polls for a supported
+JD container with at least 40 characters. Challenge pages abort the wait.
+The length threshold is a conservative completeness heuristic, not a platform
+contract; very short legitimate descriptions may be reported as failures.
+Absent selectors or content produce a timeout rather than saving a loading or
+generic page shell as a complete JD. These waits replace fixed two-second sleeps.
+
+Incremental mode also fetches detail when the stored description is absent or
+blank, or its last fetch state is not `Complete`. Failed refreshes retain any
+previous JD but set `fetch_state=FetchFailed` and preserve the error chain in
+`fetch_error`. Success sets `Complete` and clears the error. Previously stored
+legacy descriptions are not automatically revalidated; use `update-jobs-all`
+to check all current 104 listings with the stricter extraction rules.

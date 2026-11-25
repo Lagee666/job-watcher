@@ -76,9 +76,28 @@ Only newly discovered or incomplete LinkedIn IDs need detail-page fetching.
 Search cards provide summary fields. New and known jobs are opened in a second
 normal Chromium tab and the complete visible detail text is extracted. A detail
 failure is logged; a previous valid JD is preserved and empty failed content
-never replaces it. Incremental mode uses recent-first listing fields as a
+never replaces it. The browser waits up to 30 seconds for rendered search cards
+or a JD container with at least 40 characters instead of sleeping for a fixed
+two seconds. Generic page-body text is not accepted as a JD. Missing JDs and
+failed detail fetches are retried on the next synchronization, even when listing
+fields have not changed. Incremental mode uses recent-first listing fields as a
 pre-filter; `update-jobs-all` is available when every JD must be checked. See
 [docs/104-source.md](docs/104-source.md).
+
+Both sources expose `fetch_state` and an optional `fetch_error` in SQLite,
+`job-list.json`, and daily change records. A failed 104 refresh keeps the old JD
+but reports `FetchFailed`; a successful refresh clears the error. LinkedIn
+errors include HTTP status and final URL when available, or the request error
+chain. A successful HTTP response without a supported description reports
+`ParseFailed`; redirects to login/access-wall URLs report `FetchFailed`.
+Existing databases receive the nullable `fetch_error` column automatically.
+This improves diagnosis; it does not make an access-restricted website available.
+
+To capture one update's diagnostic log on the Pi:
+
+```bash
+RUST_LOG=job_watcher=debug cargo run --bin update-jobs 2>&1 | tee job-watcher-fetch.log
+```
 
 SQLite remains the only current-state store. Its identity is `(source,
 external_id)`, and existing databases are migrated in place. Deterministic
@@ -143,3 +162,13 @@ cargo fmt --check
 cargo clippy --offline --locked --all-targets --all-features -- -D warnings
 cargo test --offline --locked --all-features
 ```
+
+The optional Chromium fixture test uses only local `data:` pages. With a test
+Chromium CDP instance on port 9223, run:
+
+```bash
+cargo test --all-features chromium_waits_for_delayed_content_and_rejects_page_shell -- --ignored
+```
+
+Set `JOB_WATCHER_TEST_CDP_URL` to override its default
+`http://127.0.0.1:9223/json/version`. It does not access 104 or LinkedIn.

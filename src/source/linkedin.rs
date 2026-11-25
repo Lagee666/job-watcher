@@ -149,10 +149,10 @@ impl LinkedInAlertSource {
                 thread::sleep(Duration::from_secs(10));
             }
             fetched += 1;
-            jobs.push(fetch_job(
-                client.as_ref().expect("client exists for unknown alert"),
-                alert,
-            ));
+            let client = client
+                .as_ref()
+                .context("missing LinkedIn public-page client")?;
+            jobs.push(fetch_job(client, alert));
         }
         if jobs.iter().all(|job| job.fetch_state == "Complete") {
             record_processed_messages(&processed_message_file(), &processed_message_ids)?;
@@ -219,6 +219,17 @@ fn fetch_job(client: &Client, alert: AlertJob) -> JobListing {
         Ok(response) if response.status().is_success() => {
             let status = response.status();
             let final_url = response.url().to_string();
+            if matches!(
+                response.url().path().split('/').nth(1),
+                Some("authwall" | "login" | "checkpoint")
+            ) || response.url().path().starts_with("/uas/login")
+            {
+                return metadata_only(
+                    alert,
+                    "FetchFailed",
+                    &format!("login or access wall; HTTP {status}; final_url={final_url}"),
+                );
+            }
             match response.text() {
                 Ok(html) => {
                     debug!(
@@ -231,9 +242,23 @@ fn fetch_job(client: &Client, alert: AlertJob) -> JobListing {
                         final_url = %final_url,
                         "LinkedIn job detail fetched"
                     );
-                    enrich_from_html_at(alert, &html, Utc::now())
+                    let mut job = enrich_from_html_at(alert, &html, Utc::now());
+                    if job.fetch_state != "Complete" {
+                        job.fetch_error = Some(format!(
+                            "no supported JD description found; HTTP {status}; final_url={final_url}; body_bytes={}",
+                            html.len()
+                        ));
+                        tracing::warn!(job_id = %job.external_id, detail = ?job.fetch_error, "LinkedIn JD parsing failed");
+                    }
+                    job
                 }
-                Err(error) => metadata_only(alert, "FetchFailed", &error.to_string()),
+                Err(error) => metadata_only(
+                    alert,
+                    "FetchFailed",
+                    &format!(
+                        "response body read failed; HTTP {status}; final_url={final_url}; {error:?}"
+                    ),
+                ),
             }
         }
         Ok(response) => {
@@ -242,9 +267,24 @@ fn fetch_job(client: &Client, alert: AlertJob) -> JobListing {
             } else {
                 "FetchFailed"
             };
-            metadata_only(alert, state, &format!("HTTP {}", response.status()))
+            metadata_only(
+                alert,
+                state,
+                &format!("HTTP {}; final_url={}", response.status(), response.url()),
+            )
         }
-        Err(error) => metadata_only(alert, "FetchFailed", &error.to_string()),
+        Err(error) => {
+            let kind = if error.is_timeout() {
+                "timeout"
+            } else if error.is_connect() {
+                "connection"
+            } else if error.is_redirect() {
+                "redirect"
+            } else {
+                "request"
+            };
+            metadata_only(alert, "FetchFailed", &format!("{kind} failure: {error:?}"))
+        }
     }
 }
 
@@ -261,6 +301,7 @@ fn alert_metadata(alert: AlertJob) -> JobListing {
         published_at: None,
         platform_updated_at: None,
         fetch_state: "MetadataOnly".into(),
+        fetch_error: None,
         first_seen_at: None,
         last_seen_at: None,
         seen_count: 0,
@@ -398,6 +439,7 @@ fn enrich_from_html_at(alert: AlertJob, html: &str, scraped_at: DateTime<Utc>) -
         published_at,
         platform_updated_at: None,
         fetch_state: state.into(),
+        fetch_error: None,
         first_seen_at: None,
         last_seen_at: None,
         seen_count: 0,
@@ -418,6 +460,7 @@ fn metadata_only(alert: AlertJob, state: &str, detail: &str) -> JobListing {
         published_at: None,
         platform_updated_at: None,
         fetch_state: state.into(),
+        fetch_error: Some(detail.to_owned()),
         first_seen_at: None,
         last_seen_at: None,
         seen_count: 0,
@@ -1001,12 +1044,134 @@ fn strip_ui_suffix(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use tokio::fs;
-
     use super::{
         AlertJob, canonical_linkedin_url, enrich_from_html, enrich_from_html_at,
-        extract_alert_jobs, parse_linkedin_header,
+        extract_alert_jobs, fetch_job, parse_linkedin_header,
     };
+    use crate::watcher::JobListing;
+    use reqwest::blocking::Client;
+    use std::{thread, time::Duration};
+    use tokio::fs;
+
+    fn fetch_mock_responses(responses: Vec<String>) -> JobListing {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            for response in responses {
+                let (mut socket, _) = listener.accept().unwrap();
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut request = Vec::new();
+                let mut buffer = [0; 1024];
+                while !request.windows(4).any(|part| part == b"\r\n\r\n") {
+                    let count = socket.read(&mut buffer).unwrap();
+                    assert!(count > 0);
+                    request.extend_from_slice(&buffer[..count]);
+                }
+                socket.write_all(response.as_bytes()).unwrap();
+            }
+        });
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let client = Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+        let job = fetch_job(
+            &client,
+            AlertJob {
+                id: "123".into(),
+                url: format!("http://{address}/jobs/view/123/"),
+                title: "Alert title".into(),
+                company: "Alert company".into(),
+                location: None,
+            },
+        );
+        server.join().unwrap();
+        job
+    }
+
+    fn mock_response(status: &str, body: &str) -> String {
+        format!(
+            "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    #[test]
+    fn http_failures_preserve_status_url_and_alert_metadata() {
+        for status in [
+            "403 Forbidden",
+            "429 Too Many Requests",
+            "999 Request Denied",
+            "404 Not Found",
+        ] {
+            let job = fetch_mock_responses(vec![mock_response(status, "unavailable")]);
+            assert_eq!(
+                job.fetch_state,
+                if status.starts_with("404") {
+                    "Removed"
+                } else {
+                    "FetchFailed"
+                }
+            );
+            assert!(
+                job.fetch_error
+                    .as_deref()
+                    .unwrap()
+                    .contains(&format!("HTTP {}", &status[..3]))
+            );
+            assert!(
+                job.fetch_error
+                    .as_deref()
+                    .unwrap()
+                    .contains("final_url=http://127.0.0.1:")
+            );
+            assert_eq!(job.title, "Alert title");
+            assert_eq!(job.company, "Alert company");
+            assert!(job.description.is_none());
+        }
+    }
+
+    #[test]
+    fn successful_login_redirect_is_reported_as_fetch_failure() {
+        for path in ["/login", "/authwall", "/checkpoint", "/uas/login"] {
+            let job = fetch_mock_responses(vec![
+                format!(
+                    "HTTP/1.1 302 Found\r\nLocation: {path}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                ),
+                mock_response("200 OK", "<html>Please sign in</html>"),
+            ]);
+            assert_eq!(job.fetch_state, "FetchFailed");
+            assert!(
+                job.fetch_error
+                    .as_deref()
+                    .unwrap()
+                    .contains("login or access wall")
+            );
+            assert!(job.fetch_error.as_deref().unwrap().contains(path));
+        }
+    }
+
+    #[test]
+    fn successful_response_without_jd_has_parse_diagnostics() {
+        let job = fetch_mock_responses(vec![mock_response("200 OK", "<html>Page shell</html>")]);
+        assert_eq!(job.fetch_state, "ParseFailed");
+        assert!(job.fetch_error.as_deref().unwrap().contains("HTTP 200 OK"));
+        assert!(job.fetch_error.as_deref().unwrap().contains("body_bytes="));
+    }
+
+    #[test]
+    fn successful_jd_response_has_no_fetch_error() {
+        let job = fetch_mock_responses(vec![mock_response(
+            "200 OK",
+            include_str!("fixture/linkedin_public.html"),
+        )]);
+        assert_eq!(job.fetch_state, "Complete");
+        assert!(job.fetch_error.is_none());
+    }
 
     #[test]
     fn alert_urls_are_canonical_and_deduplicated() {

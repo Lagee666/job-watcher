@@ -5,6 +5,7 @@
 /Cargo.lock
 /job-list.html
 /job-list.json
+/job-watcher-fetch.log
 /job-list/
 /jobs.sqlite3
 /changes/

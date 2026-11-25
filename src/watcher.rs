@@ -15,7 +15,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
     thread,
-    time::{Duration, SystemTime},
+    time::{Duration, Instant, SystemTime},
 };
 use tracing::{debug, error, info, warn};
 
@@ -24,6 +24,20 @@ const SEARCH_URL: &str =
 const SOURCE: &str = "104";
 const TAIPEI_OFFSET: i32 = 8 * 60 * 60;
 const JD_BATCH_SIZE: usize = 10;
+const CONTENT_TIMEOUT: Duration = Duration::from_secs(30);
+const DETAIL_SCRIPT: &str = r#"(() => {
+    const selectors = [
+        '.job-description__content', '.job-description',
+        '[id*="job-description"]', '[class*="job-description"]'
+    ];
+    for (const selector of selectors) {
+        for (const element of document.querySelectorAll(selector)) {
+            const text = element.innerText?.trim() || '';
+            if ([...text].length >= 40 && !/^(載入中|讀取中|loading)[.…。\s]*$/i.test(text)) return text;
+        }
+    }
+    return '';
+})()"#;
 
 #[derive(Clone, Copy, Debug)]
 enum JobUpdateMode {
@@ -52,6 +66,8 @@ pub struct JobListing {
     pub platform_updated_at: Option<String>,
     #[serde(default = "default_fetch_state")]
     pub fetch_state: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fetch_error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub first_seen_at: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -85,6 +101,8 @@ pub struct ChangeRecord {
     pub url: String,
     #[serde(default = "default_fetch_state")]
     pub fetch_state: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fetch_error: Option<String>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub changed_fields: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -539,13 +557,58 @@ fn is_challenge_page(title: &str, html: &str) -> bool {
                 || html.contains("Verify you are human")))
 }
 
+fn wait_for_104_content<T>(
+    tab: &Tab,
+    operation: &str,
+    timeout: Duration,
+    mut extract: impl FnMut(&Tab) -> Result<Option<T>>,
+) -> Result<T> {
+    let started = Instant::now();
+    loop {
+        if is_challenge_page(&tab.get_title()?, &tab.get_content()?) {
+            anyhow::bail!("104 returned a challenge while waiting for {operation}");
+        }
+        if let Some(content) = extract(tab)? {
+            return Ok(content);
+        }
+        let Some(remaining) = timeout.checked_sub(started.elapsed()) else {
+            anyhow::bail!(
+                "timed out waiting for {operation} after {} seconds",
+                timeout.as_secs()
+            );
+        };
+        thread::sleep(remaining.min(Duration::from_millis(250)));
+    }
+}
+
+fn wait_for_search_cards(tab: &Tab) -> Result<()> {
+    wait_for_104_content(tab, "104 search cards", CONTENT_TIMEOUT, |tab| {
+        Ok((!tab
+            .find_elements("div[data-job-no] a.info-job__text, div[data-job-no] a.info-job")?
+            .is_empty())
+        .then_some(()))
+    })
+}
+
+fn wait_for_detail(tab: &Tab, timeout: Duration) -> Result<String> {
+    wait_for_104_content(tab, "104 JD description", timeout, |tab| {
+        let result = tab.evaluate(DETAIL_SCRIPT, false)?;
+        let value = result.value.context("JD extraction returned no value")?;
+        let description = value
+            .as_str()
+            .context("JD extraction returned a non-string value")?
+            .trim();
+        Ok((!description.is_empty()).then(|| description.to_owned()))
+    })
+}
+
 fn extract_job_list(tab: &Tab) -> Result<Vec<JobListing>> {
     let result = tab.evaluate(r#"(async () => {
         const jobs = new Map(); const text = (root, selector) => { const v = root.querySelector(selector)?.innerText?.trim(); return v || null; };
         const collect = () => { for (const card of document.querySelectorAll('div[data-job-no]')) {
             const id = card.getAttribute('data-job-no'); const anchor = card.querySelector('a.info-job__text, a.info-job'); if (!id || !anchor) continue;
             let url = anchor.href; try { url = new URL(url).searchParams.get('url') || url; } catch (_) {}
-            jobs.set(id, { external_id:id, title:text(card,'a.info-job__text, .info-name') || anchor.innerText.trim(), company:text(card,'a.info-company__text, .info-company > a') || '', location:text(card,'[data-gtm-joblist^="職缺-地區"]'), salary:text(card,'[data-gtm-joblist^="職缺-薪資"]'), description:text(card,'.info-content'), url, published_at:text(card,'.job-mobile__date') });
+            jobs.set(id, { external_id:id, title:text(card,'a.info-job__text, .info-name') || anchor.innerText.trim(), company:text(card,'a.info-company__text, .info-company > a') || '', location:text(card,'[data-gtm-joblist^="職缺-地區"]'), salary:text(card,'[data-gtm-joblist^="職缺-薪資"]'), description:null, fetch_state:'MetadataOnly', url, published_at:text(card,'.job-mobile__date') });
         }};
         const scroller = document.querySelector('.vue-recycle-scroller'); for (let i=0;i<120;i++) { collect(); if (!scroller) break; const old=scroller.scrollTop; scroller.scrollTop += Math.max(window.innerHeight,600); scroller.dispatchEvent(new Event('scroll',{bubbles:true})); await new Promise(r=>setTimeout(r,100)); if (scroller.scrollTop === old) break; } collect(); return JSON.stringify([...jobs.values()]);
     })()"#, true)?;
@@ -653,39 +716,8 @@ fn extract_detail(browser: &Browser, job: &JobListing) -> Result<String> {
             .with_context(|| format!("failed to navigate to JD {}", job.external_id))?
             .wait_until_navigated()
             .context("JD page did not finish navigating")?;
-        thread::sleep(Duration::from_secs(2));
-        let title = tab.get_title()?;
-        let html = tab.get_content()?;
-        if is_challenge_page(&title, &html) {
-            anyhow::bail!("104 returned a challenge for JD {}", job.external_id);
-        }
-        let result = tab.evaluate(
-            r#"(() => {
-            const selectors = [
-                '.job-description',
-                '.job-description__content',
-                '[id*="job-description"]',
-                '[class*="job-description"]',
-                '[class*="description"]',
-                'article'
-            ];
-            const candidates = selectors
-                .flatMap(selector => [...document.querySelectorAll(selector)])
-                .map(element => element.innerText?.trim() || '')
-                .filter(text => text.length > 0);
-            return candidates.sort((left, right) => right.length - left.length)[0]
-                || document.body?.innerText?.trim()
-                || '';
-        })()"#,
-            true,
-        )?;
-        Ok(result
-            .value
-            .context("JD extraction returned no value")?
-            .as_str()
-            .unwrap_or_default()
-            .trim()
-            .to_owned())
+        wait_for_detail(&tab, CONTENT_TIMEOUT)
+            .with_context(|| format!("failed to extract JD {}", job.external_id))
     })();
     let cleanup_result = tab_cleanup.close();
     match (result, cleanup_result) {
@@ -713,6 +745,7 @@ fn ensure_schema(connection: &Connection) -> Result<()> {
         ("description", "TEXT"),
         ("platform_updated_at", "TEXT"),
         ("fetch_state", "TEXT NOT NULL DEFAULT 'Complete'"),
+        ("fetch_error", "TEXT"),
         ("first_seen_at", "TEXT"),
         ("last_seen_at", "TEXT"),
         ("seen_count", "INTEGER NOT NULL DEFAULT 1"),
@@ -735,7 +768,7 @@ fn ensure_schema(connection: &Connection) -> Result<()> {
 }
 
 fn load_known_jobs(connection: &Connection) -> Result<HashMap<String, JobListing>> {
-    let mut statement = connection.prepare("SELECT source,external_id,title,company,COALESCE(work_site,location),COALESCE(annual_salary,salary),description,url,published_at,platform_updated_at,fetch_state,first_seen_at,last_seen_at,seen_count FROM jobs WHERE source='104'")?;
+    let mut statement = connection.prepare("SELECT source,external_id,title,company,COALESCE(work_site,location),COALESCE(annual_salary,salary),description,url,published_at,platform_updated_at,fetch_state,first_seen_at,last_seen_at,seen_count,fetch_error FROM jobs WHERE source='104'")?;
     let rows = statement.query_map([], |row| {
         Ok(JobListing {
             source: row.get(0)?,
@@ -752,6 +785,7 @@ fn load_known_jobs(connection: &Connection) -> Result<HashMap<String, JobListing
             first_seen_at: row.get(11)?,
             last_seen_at: row.get(12)?,
             seen_count: row.get(13)?,
+            fetch_error: row.get(14)?,
         })
     })?;
     rows.map(|row| row.map(|job| (job.external_id.clone(), job)))
@@ -760,7 +794,7 @@ fn load_known_jobs(connection: &Connection) -> Result<HashMap<String, JobListing
 }
 
 fn load_all_known_jobs(connection: &Connection) -> Result<HashMap<(String, String), JobListing>> {
-    let mut statement = connection.prepare("SELECT source,external_id,title,company,COALESCE(work_site,location),COALESCE(annual_salary,salary),description,url,published_at,platform_updated_at,fetch_state,first_seen_at,last_seen_at,seen_count FROM jobs")?;
+    let mut statement = connection.prepare("SELECT source,external_id,title,company,COALESCE(work_site,location),COALESCE(annual_salary,salary),description,url,published_at,platform_updated_at,fetch_state,first_seen_at,last_seen_at,seen_count,fetch_error FROM jobs")?;
     let rows = statement.query_map([], |row| {
         Ok(JobListing {
             source: row.get(0)?,
@@ -777,6 +811,7 @@ fn load_all_known_jobs(connection: &Connection) -> Result<HashMap<(String, Strin
             first_seen_at: row.get(11)?,
             last_seen_at: row.get(12)?,
             seen_count: row.get(13)?,
+            fetch_error: row.get(14)?,
         })
     })?;
     rows.map(|row| row.map(|job| ((job.source.clone(), job.external_id.clone()), job)))
@@ -828,7 +863,41 @@ fn changed_fields(old: &JobListing, new: &JobListing) -> Vec<String> {
 fn listing_fields_changed(old: &JobListing, new: &JobListing) -> bool {
     changed_fields(old, new)
         .into_iter()
-        .any(|field| field != "description")
+        .any(|field| field != "description" && field != "fetch_state")
+}
+
+fn should_fetch_detail(old: Option<&JobListing>, new: &JobListing, mode: JobUpdateMode) -> bool {
+    old.is_none_or(|old| {
+        matches!(mode, JobUpdateMode::All)
+            || old.fetch_state != "Complete"
+            || old
+                .description
+                .as_deref()
+                .is_none_or(|text| text.trim().is_empty())
+            || listing_fields_changed(old, new)
+    })
+}
+
+fn apply_detail_result(job: &mut JobListing, old: Option<&JobListing>, result: Result<String>) {
+    match result.and_then(|description| {
+        if description.trim().is_empty() {
+            anyhow::bail!("104 JD description was empty");
+        }
+        Ok(description)
+    }) {
+        Ok(description) => {
+            info!(external_id = %job.external_id, description_chars = description.chars().count(), "full JD extracted");
+            job.description = Some(description);
+            job.fetch_state = "Complete".into();
+            job.fetch_error = None;
+        }
+        Err(error) => {
+            error!(external_id = %job.external_id, error = %format!("{error:#}"), "JD fetch failed; preserving previous JD");
+            job.description = old.and_then(|old| old.description.clone());
+            job.fetch_state = "FetchFailed".into();
+            job.fetch_error = Some(format!("{error:#}"));
+        }
+    }
 }
 
 fn copy_tracking(target: &mut JobListing, persisted: &JobListing) {
@@ -869,6 +938,7 @@ fn change_record(
         published_at: job.published_at.clone(),
         url: job.url.clone(),
         fetch_state: job.fetch_state.clone(),
+        fetch_error: job.fetch_error.clone(),
         changed_fields: fields,
         description: job.description.clone(),
         deleted_at,
@@ -891,7 +961,7 @@ fn persist_state(
         .transaction()
         .context("failed to begin SQLite state transaction")?;
     {
-        let mut statement = tx.prepare("INSERT INTO jobs(source,external_id,title,company,location,salary,description,url,published_at,platform_updated_at,fetch_state,work_site,annual_salary,last_updated,first_seen_at,last_seen_at,seen_count) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?5,?6,COALESCE(?10,?9),?12,?12,1) ON CONFLICT(source,external_id) DO UPDATE SET title=excluded.title,company=excluded.company,location=excluded.location,salary=excluded.salary,description=COALESCE(excluded.description,jobs.description),url=excluded.url,published_at=excluded.published_at,platform_updated_at=excluded.platform_updated_at,fetch_state=excluded.fetch_state,work_site=excluded.work_site,annual_salary=excluded.annual_salary,last_updated=excluded.last_updated,first_seen_at=COALESCE(jobs.first_seen_at,excluded.first_seen_at),last_seen_at=excluded.last_seen_at,seen_count=COALESCE(jobs.seen_count,0)+1")?;
+        let mut statement = tx.prepare("INSERT INTO jobs(source,external_id,title,company,location,salary,description,url,published_at,platform_updated_at,fetch_state,work_site,annual_salary,last_updated,first_seen_at,last_seen_at,seen_count,fetch_error) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?5,?6,COALESCE(?10,?9),?12,?12,1,?13) ON CONFLICT(source,external_id) DO UPDATE SET title=excluded.title,company=excluded.company,location=excluded.location,salary=excluded.salary,description=COALESCE(excluded.description,jobs.description),url=excluded.url,published_at=excluded.published_at,platform_updated_at=excluded.platform_updated_at,fetch_state=excluded.fetch_state,fetch_error=excluded.fetch_error,work_site=excluded.work_site,annual_salary=excluded.annual_salary,last_updated=excluded.last_updated,first_seen_at=COALESCE(jobs.first_seen_at,excluded.first_seen_at),last_seen_at=excluded.last_seen_at,seen_count=COALESCE(jobs.seen_count,0)+1")?;
         let mut persisted_ids = HashSet::new();
         for job in jobs {
             if !persisted_ids.insert(job.external_id.clone()) {
@@ -910,7 +980,8 @@ fn persist_state(
                     job.published_at,
                     job.platform_updated_at,
                     job.fetch_state,
-                    run_at
+                    run_at,
+                    job.fetch_error
                 ])
                 .with_context(|| format!("failed to persist job {}", job.external_id))?;
         }
@@ -1281,7 +1352,7 @@ fn synchronize_104_and_linkedin(
     if is_challenge_page(&title, &html) {
         anyhow::bail!("104 returned a Cloudflare challenge; refusing to persist an empty result");
     }
-    thread::sleep(Duration::from_secs(2));
+    wait_for_search_cards(&tab)?;
     let total_pages = extract_total_pages(&tab)?;
     let mut connection = Connection::open("jobs.sqlite3").context("failed to open jobs.sqlite3")?;
     ensure_schema(&connection)?;
@@ -1298,7 +1369,7 @@ fn synchronize_104_and_linkedin(
         if page > 1 {
             tab.navigate_to(&format!("{SEARCH_URL}&page={page}"))?
                 .wait_until_navigated()?;
-            thread::sleep(Duration::from_secs(2));
+            wait_for_search_cards(&tab)?;
         }
         let page_jobs =
             extract_job_list(&tab).with_context(|| format!("failed to extract page {page}"))?;
@@ -1346,49 +1417,16 @@ fn synchronize_104_and_linkedin(
             title = %job.title,
             "executing JD fetch"
         );
-        let write_file = !known.contains_key(&job.external_id)
-            || matches!(update_mode, JobUpdateMode::All)
-            || known
-                .get(&job.external_id)
-                .is_some_and(|old| listing_fields_changed(old, &job));
-        if let Some(old) = known.get(&job.external_id) {
-            let fetch_detail = write_file;
-            if fetch_detail {
-                debug!(external_id = %job.external_id, title = %job.title, "fetching complete JD");
-                match extract_detail(&detail_browser, &job) {
-                    Ok(description) if !description.is_empty() => {
-                        info!(
-                            external_id = %job.external_id,
-                            description_chars = description.chars().count(),
-                            "full JD extracted"
-                        );
-                        job.description = Some(description);
-                    }
-                    Ok(_) => job.description = old.description.clone(),
-                    Err(error) => {
-                        error!(external_id = %job.external_id, error = %error, "JD fetch failed; preserving previous JD");
-                        job.description = old.description.clone();
-                    }
-                }
-            } else {
-                debug!(external_id = %job.external_id, title = %job.title, "JD unchanged; reusing persisted JD");
-                job.description = old.description.clone();
-            }
-        } else {
-            debug!(external_id = %job.external_id, title = %job.title, "fetching complete JD for new job");
-            job.description = None;
-            if let Err(error) = extract_detail(&detail_browser, &job).map(|description| {
-                if !description.is_empty() {
-                    info!(
-                        external_id = %job.external_id,
-                        description_chars = description.chars().count(),
-                        "full JD extracted for new job"
-                    );
-                    job.description = Some(description);
-                }
-            }) {
-                error!(external_id = %job.external_id, error = %error, "JD fetch failed for new job");
-            }
+        let old = known.get(&job.external_id);
+        let write_file = should_fetch_detail(old, &job, update_mode);
+        if write_file {
+            let detail = extract_detail(&detail_browser, &job);
+            apply_detail_result(&mut job, old, detail);
+        } else if let Some(old) = old {
+            debug!(external_id = %job.external_id, title = %job.title, "JD unchanged; reusing persisted JD");
+            job.description = old.description.clone();
+            job.fetch_state = old.fetch_state.clone();
+            job.fetch_error = old.fetch_error.clone();
         }
         if write_file {
             let write_result = if let Some(writer) = job_writer.as_mut() {
@@ -1797,6 +1835,168 @@ fn startup_sync_enabled() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn incremental_fetch_retries_missing_or_failed_descriptions() {
+        let mut old = sample();
+        let mut listed = old.clone();
+        listed.description = None;
+        listed.fetch_state = "MetadataOnly".into();
+        assert!(!should_fetch_detail(
+            Some(&old),
+            &listed,
+            JobUpdateMode::Changed
+        ));
+        assert!(should_fetch_detail(Some(&old), &listed, JobUpdateMode::All));
+        assert!(should_fetch_detail(None, &listed, JobUpdateMode::Changed));
+        for description in [None, Some("  ".into())] {
+            old.description = description;
+            assert!(should_fetch_detail(
+                Some(&old),
+                &listed,
+                JobUpdateMode::Changed
+            ));
+        }
+        old.description = Some("previous valid JD".into());
+        old.fetch_state = "FetchFailed".into();
+        assert!(should_fetch_detail(
+            Some(&old),
+            &listed,
+            JobUpdateMode::Changed
+        ));
+        old.fetch_state = "Complete".into();
+        listed.salary = Some("new salary".into());
+        assert!(should_fetch_detail(
+            Some(&old),
+            &listed,
+            JobUpdateMode::Changed
+        ));
+    }
+
+    #[test]
+    fn detail_failure_keeps_old_content_and_recovery_clears_error() {
+        let old = sample();
+        let mut job = old.clone();
+        apply_detail_result(
+            &mut job,
+            Some(&old),
+            Err(anyhow::anyhow!("navigation timeout")),
+        );
+        assert_eq!(job.description, old.description);
+        assert_eq!(job.fetch_state, "FetchFailed");
+        assert_eq!(job.fetch_error.as_deref(), Some("navigation timeout"));
+        apply_detail_result(&mut job, Some(&old), Ok("new complete JD".into()));
+        assert_eq!(job.description.as_deref(), Some("new complete JD"));
+        assert_eq!(job.fetch_state, "Complete");
+        assert!(job.fetch_error.is_none());
+        apply_detail_result(&mut job, None, Ok("  ".into()));
+        assert!(job.description.is_none());
+        assert_eq!(job.fetch_state, "FetchFailed");
+    }
+
+    #[test]
+    fn fetch_error_survives_database_and_history_and_clears_on_recovery() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        let mut job = sample();
+        job.fetch_state = "FetchFailed".into();
+        job.fetch_error = Some("HTTP 999; final_url=https://example.test/job".into());
+        let ids = HashSet::from([job.external_id.clone()]);
+        persist_state(
+            &mut connection,
+            SOURCE,
+            std::slice::from_ref(&job),
+            &ids,
+            false,
+            "2026-11-25",
+        )
+        .unwrap();
+        let saved = load_known_jobs(&connection)
+            .unwrap()
+            .remove(&job.external_id)
+            .unwrap();
+        assert_eq!(saved.fetch_error, job.fetch_error);
+        let all = load_all_known_jobs(&connection).unwrap();
+        assert_eq!(
+            all[&(SOURCE.into(), job.external_id.clone())].fetch_error,
+            job.fetch_error
+        );
+        let record = change_record("updated", &saved, vec!["fetch_state".into()], None);
+        assert_eq!(
+            serde_json::to_value(record).unwrap()["fetch_error"],
+            job.fetch_error.as_deref().unwrap()
+        );
+        job.fetch_state = "Complete".into();
+        job.fetch_error = None;
+        persist_state(&mut connection, SOURCE, &[job], &ids, false, "2026-11-26").unwrap();
+        assert!(
+            load_known_jobs(&connection).unwrap()["abc"]
+                .fetch_error
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn legacy_json_without_fetch_error_still_loads() {
+        let mut value = serde_json::to_value(sample()).unwrap();
+        value.as_object_mut().unwrap().remove("fetch_error");
+        assert!(
+            serde_json::from_value::<JobListing>(value)
+                .unwrap()
+                .fetch_error
+                .is_none()
+        );
+    }
+
+    #[test]
+    #[ignore = "requires Chromium CDP on JOB_WATCHER_TEST_CDP_URL (default localhost:9223)"]
+    fn chromium_waits_for_delayed_content_and_rejects_page_shell() {
+        let version: ChromeVersion = reqwest::blocking::get(
+            std::env::var("JOB_WATCHER_TEST_CDP_URL")
+                .unwrap_or_else(|_| "http://127.0.0.1:9223/json/version".into()),
+        )
+        .unwrap()
+        .json()
+        .unwrap();
+        let browser = Browser::connect(version.web_socket_debugger_url).unwrap();
+        let tab = browser.new_tab().unwrap();
+        let mut cleanup = TabCleanup::new(Arc::clone(&tab), "fixture tab");
+        let html = r#"<html><body><p>Loading page shell; this must never become the description.</p>
+            <script>setTimeout(() => {
+                document.body.innerHTML += '<div class="job-description">Complete job responsibilities and qualifications loaded asynchronously.</div>';
+            }, 2300);</script></body></html>"#;
+        tab.navigate_to(&format!("data:text/html;base64,{}", STANDARD.encode(html)))
+            .unwrap()
+            .wait_until_navigated()
+            .unwrap();
+        let description = wait_for_detail(&tab, Duration::from_secs(10)).unwrap();
+        assert!(description.starts_with("Complete job responsibilities"));
+        assert!(!description.contains("Loading page shell"));
+        tab.evaluate(r#"setTimeout(() => {
+            document.body.innerHTML += '<div data-job-no="abc"><a class="info-job" href="https://www.104.com.tw/job/abc">Rust</a><div class="info-content">A summary card snippet must never be treated as a complete description.</div></div>';
+        }, 500)"#, false).unwrap();
+        wait_for_search_cards(&tab).unwrap();
+        let listed = extract_job_list(&tab).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].fetch_state, "MetadataOnly");
+        assert!(listed[0].description.is_none());
+        tab.navigate_to(&format!("data:text/html;base64,{}", STANDARD.encode("<body><article>A long generic error page with unrelated text that is not a job description.</article></body>"))).unwrap().wait_until_navigated().unwrap();
+        assert!(wait_for_detail(&tab, Duration::from_millis(500)).is_err());
+        tab.navigate_to(&format!(
+            "data:text/html;base64,{}",
+            STANDARD.encode(r#"<title>Just a moment...</title><body>Verify you are human</body>"#)
+        ))
+        .unwrap()
+        .wait_until_navigated()
+        .unwrap();
+        assert!(
+            wait_for_detail(&tab, Duration::from_secs(1))
+                .unwrap_err()
+                .to_string()
+                .contains("challenge")
+        );
+        cleanup.close().unwrap();
+    }
+
     #[test]
     fn whitespace_only_description_is_unchanged() {
         let mut a = sample();
@@ -2035,6 +2235,7 @@ mod tests {
             published_at: Some("8/16".into()),
             platform_updated_at: None,
             fetch_state: "Complete".into(),
+            fetch_error: None,
             first_seen_at: None,
             last_seen_at: None,
             seen_count: 0,

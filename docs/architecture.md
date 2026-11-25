@@ -79,3 +79,13 @@ notification code. Both sources use the same `(source, external_id)` SQLite
 identity, combined change history, Gmail attachment, and LINE reporting. Text
 comparison normalizes line endings and insignificant whitespace.
 Updated records include deterministic `changed_fields`.
+
+The optional cross-platform `fetch_error` field retains the latest failure
+reason in SQLite and JSON exports. Schema migration adds a nullable column;
+legacy JSON without the field remains readable. Diagnostic text itself is
+excluded from meaningful-field comparison to avoid reporting changes solely
+because a network error string changed. A failure state can coexist with a
+previously valid description, indicating that the current refresh failed.
+Successful retrieval clears the error. 104 detail scheduling explicitly retries
+missing descriptions and failed refreshes on the next cycle; summary-card
+`MetadataOnly` states do not force an otherwise unchanged complete JD to reload.
