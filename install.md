@@ -167,6 +167,9 @@ set the following in the system environment file:
 
 ```dotenv
 LINKEDIN_ENABLED=true
+LINKEDIN_FETCH_PUBLIC_DETAILS=false
+# Optional exact company hosts for JobPosting JSON-LD pages.
+JOB_WATCHER_CAREER_HOSTS=
 GMAIL_OAUTH_CLIENT_FILE=/etc/job-watcher/google-oauth-client.json
 GMAIL_OAUTH_TOKEN_FILE=/var/lib/job-watcher/gmail-oauth-token.json
 LINKEDIN_PROCESSED_MESSAGES_FILE=/var/lib/job-watcher/linkedin-processed-gmail-messages.json
@@ -178,6 +181,18 @@ file and token-file settings present. Open the printed Google consent URL on a
 browser, approve Gmail read-only access, and return to the Pi. The resulting
 refresh token is stored in the token file and reused on later scheduled runs.
 The source uses no LinkedIn browser session or login cookie.
+The default flow extracts each email card's metadata and may enrich directly
+associated Greenhouse/Lever links. Other company pages require an exact host
+in `JOB_WATCHER_CAREER_HOSTS` and a matching structured JobPosting. With no
+supported link, the job remains `MetadataOnly`. Public LinkedIn page fetching
+is opt-in; see [docs/linkedin-source.md](docs/linkedin-source.md).
+
+To inspect the decoded email metadata without fetching job pages or updating
+SQLite, run:
+
+```bash
+cargo run --bin search-linkedin-alerts
+```
 
 ## Configure LINE notifications
 

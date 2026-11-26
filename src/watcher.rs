@@ -69,6 +69,8 @@ pub struct JobListing {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fetch_error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub first_seen_at: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_seen_at: Option<String>,
@@ -103,6 +105,8 @@ pub struct ChangeRecord {
     pub fetch_state: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fetch_error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description_url: Option<String>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub changed_fields: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -771,6 +775,7 @@ fn ensure_schema(connection: &Connection) -> Result<()> {
         ("platform_updated_at", "TEXT"),
         ("fetch_state", "TEXT NOT NULL DEFAULT 'Complete'"),
         ("fetch_error", "TEXT"),
+        ("description_url", "TEXT"),
         ("first_seen_at", "TEXT"),
         ("last_seen_at", "TEXT"),
         ("seen_count", "INTEGER NOT NULL DEFAULT 1"),
@@ -793,7 +798,7 @@ fn ensure_schema(connection: &Connection) -> Result<()> {
 }
 
 fn load_known_jobs(connection: &Connection) -> Result<HashMap<String, JobListing>> {
-    let mut statement = connection.prepare("SELECT source,external_id,title,company,COALESCE(work_site,location),COALESCE(annual_salary,salary),description,url,published_at,platform_updated_at,fetch_state,first_seen_at,last_seen_at,seen_count,fetch_error FROM jobs WHERE source='104'")?;
+    let mut statement = connection.prepare("SELECT source,external_id,title,company,COALESCE(work_site,location),COALESCE(annual_salary,salary),description,url,published_at,platform_updated_at,fetch_state,first_seen_at,last_seen_at,seen_count,fetch_error,description_url FROM jobs WHERE source='104'")?;
     let rows = statement.query_map([], |row| {
         Ok(JobListing {
             source: row.get(0)?,
@@ -811,6 +816,7 @@ fn load_known_jobs(connection: &Connection) -> Result<HashMap<String, JobListing
             last_seen_at: row.get(12)?,
             seen_count: row.get(13)?,
             fetch_error: row.get(14)?,
+            description_url: row.get(15)?,
         })
     })?;
     rows.map(|row| row.map(|job| (job.external_id.clone(), job)))
@@ -819,7 +825,7 @@ fn load_known_jobs(connection: &Connection) -> Result<HashMap<String, JobListing
 }
 
 fn load_all_known_jobs(connection: &Connection) -> Result<HashMap<(String, String), JobListing>> {
-    let mut statement = connection.prepare("SELECT source,external_id,title,company,COALESCE(work_site,location),COALESCE(annual_salary,salary),description,url,published_at,platform_updated_at,fetch_state,first_seen_at,last_seen_at,seen_count,fetch_error FROM jobs")?;
+    let mut statement = connection.prepare("SELECT source,external_id,title,company,COALESCE(work_site,location),COALESCE(annual_salary,salary),description,url,published_at,platform_updated_at,fetch_state,first_seen_at,last_seen_at,seen_count,fetch_error,description_url FROM jobs")?;
     let rows = statement.query_map([], |row| {
         Ok(JobListing {
             source: row.get(0)?,
@@ -837,6 +843,7 @@ fn load_all_known_jobs(connection: &Connection) -> Result<HashMap<(String, Strin
             last_seen_at: row.get(12)?,
             seen_count: row.get(13)?,
             fetch_error: row.get(14)?,
+            description_url: row.get(15)?,
         })
     })?;
     rows.map(|row| row.map(|job| ((job.source.clone(), job.external_id.clone()), job)))
@@ -882,13 +889,19 @@ fn changed_fields(old: &JobListing, new: &JobListing) -> Vec<String> {
     if old.fetch_state != new.fetch_state {
         fields.push("fetch_state".into());
     }
+    if old.description_url != new.description_url {
+        fields.push("description_url".into());
+    }
     fields
 }
 
 fn listing_fields_changed(old: &JobListing, new: &JobListing) -> bool {
-    changed_fields(old, new)
-        .into_iter()
-        .any(|field| field != "description" && field != "fetch_state")
+    changed_fields(old, new).into_iter().any(|field| {
+        !matches!(
+            field.as_str(),
+            "description" | "fetch_state" | "description_url"
+        )
+    })
 }
 
 fn should_fetch_detail(old: Option<&JobListing>, new: &JobListing, mode: JobUpdateMode) -> bool {
@@ -913,12 +926,14 @@ fn apply_detail_result(job: &mut JobListing, old: Option<&JobListing>, result: R
         Ok(description) => {
             info!(external_id = %job.external_id, description_chars = description.chars().count(), "full JD extracted");
             job.description = Some(description);
+            job.description_url = Some(job.url.clone());
             job.fetch_state = "Complete".into();
             job.fetch_error = None;
         }
         Err(error) => {
             error!(external_id = %job.external_id, error = %format!("{error:#}"), "JD fetch failed; preserving previous JD");
             job.description = old.and_then(|old| old.description.clone());
+            job.description_url = old.and_then(|old| old.description_url.clone());
             job.fetch_state = "FetchFailed".into();
             job.fetch_error = Some(format!("{error:#}"));
         }
@@ -964,6 +979,7 @@ fn change_record(
         url: job.url.clone(),
         fetch_state: job.fetch_state.clone(),
         fetch_error: job.fetch_error.clone(),
+        description_url: job.description_url.clone(),
         changed_fields: fields,
         description: job.description.clone(),
         deleted_at,
@@ -986,7 +1002,7 @@ fn persist_state(
         .transaction()
         .context("failed to begin SQLite state transaction")?;
     {
-        let mut statement = tx.prepare("INSERT INTO jobs(source,external_id,title,company,location,salary,description,url,published_at,platform_updated_at,fetch_state,work_site,annual_salary,last_updated,first_seen_at,last_seen_at,seen_count,fetch_error) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?5,?6,COALESCE(?10,?9),?12,?12,1,?13) ON CONFLICT(source,external_id) DO UPDATE SET title=excluded.title,company=excluded.company,location=excluded.location,salary=excluded.salary,description=COALESCE(excluded.description,jobs.description),url=excluded.url,published_at=excluded.published_at,platform_updated_at=excluded.platform_updated_at,fetch_state=excluded.fetch_state,fetch_error=excluded.fetch_error,work_site=excluded.work_site,annual_salary=excluded.annual_salary,last_updated=excluded.last_updated,first_seen_at=COALESCE(jobs.first_seen_at,excluded.first_seen_at),last_seen_at=excluded.last_seen_at,seen_count=COALESCE(jobs.seen_count,0)+1")?;
+        let mut statement = tx.prepare("INSERT INTO jobs(source,external_id,title,company,location,salary,description,url,published_at,platform_updated_at,fetch_state,work_site,annual_salary,last_updated,first_seen_at,last_seen_at,seen_count,fetch_error,description_url) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?5,?6,COALESCE(?10,?9),?12,?12,1,?13,?14) ON CONFLICT(source,external_id) DO UPDATE SET title=excluded.title,company=excluded.company,location=excluded.location,salary=excluded.salary,description=COALESCE(excluded.description,jobs.description),url=excluded.url,published_at=excluded.published_at,platform_updated_at=excluded.platform_updated_at,fetch_state=excluded.fetch_state,fetch_error=excluded.fetch_error,description_url=CASE WHEN excluded.description IS NULL THEN jobs.description_url ELSE excluded.description_url END,work_site=excluded.work_site,annual_salary=excluded.annual_salary,last_updated=excluded.last_updated,first_seen_at=COALESCE(jobs.first_seen_at,excluded.first_seen_at),last_seen_at=excluded.last_seen_at,seen_count=COALESCE(jobs.seen_count,0)+1")?;
         let mut persisted_ids = HashSet::new();
         for job in jobs {
             if !persisted_ids.insert(job.external_id.clone()) {
@@ -1006,7 +1022,8 @@ fn persist_state(
                     job.platform_updated_at,
                     job.fetch_state,
                     run_at,
-                    job.fetch_error
+                    job.fetch_error,
+                    job.description_url
                 ])
                 .with_context(|| format!("failed to persist job {}", job.external_id))?;
         }
@@ -1452,6 +1469,7 @@ fn synchronize_104_and_linkedin(
             job.description = old.description.clone();
             job.fetch_state = old.fetch_state.clone();
             job.fetch_error = old.fetch_error.clone();
+            job.description_url = old.description_url.clone();
         }
         if write_file {
             let write_result = if let Some(writer) = job_writer.as_mut() {
@@ -2027,6 +2045,58 @@ mod tests {
     }
 
     #[test]
+    fn jd_source_url_is_migrated_exported_and_preserved_on_missing_content() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        let mut job = sample();
+        job.description_url = Some("https://boards.greenhouse.io/acme/jobs/1234".into());
+        let ids = HashSet::from([job.external_id.clone()]);
+        persist_state(
+            &mut connection,
+            SOURCE,
+            std::slice::from_ref(&job),
+            &ids,
+            false,
+            "2026-11-26",
+        )
+        .unwrap();
+        let saved = load_known_jobs(&connection)
+            .unwrap()
+            .remove(&job.external_id)
+            .unwrap();
+        assert_eq!(saved.description_url, job.description_url);
+        let record = change_record("new", &saved, vec![], None);
+        assert_eq!(
+            serde_json::to_value(record).unwrap()["description_url"],
+            job.description_url.as_deref().unwrap()
+        );
+        let mut failed = job.clone();
+        failed.description = None;
+        failed.description_url = None;
+        failed.fetch_state = "FetchFailed".into();
+        persist_state(
+            &mut connection,
+            SOURCE,
+            &[failed],
+            &ids,
+            false,
+            "2026-11-27",
+        )
+        .unwrap();
+        assert_eq!(
+            load_known_jobs(&connection).unwrap()["abc"].description_url,
+            job.description_url
+        );
+        let mut legacy = serde_json::to_value(job).unwrap();
+        legacy.as_object_mut().unwrap().remove("description_url");
+        assert!(
+            serde_json::from_value::<JobListing>(legacy)
+                .unwrap()
+                .description_url
+                .is_none()
+        );
+    }
+
+    #[test]
     #[ignore = "requires Chromium CDP on JOB_WATCHER_TEST_CDP_URL (default localhost:9223)"]
     fn chromium_waits_for_delayed_content_and_rejects_page_shell() {
         let version: ChromeVersion = reqwest::blocking::get(
@@ -2315,6 +2385,7 @@ mod tests {
             platform_updated_at: None,
             fetch_state: "Complete".into(),
             fetch_error: None,
+            description_url: None,
             first_seen_at: None,
             last_seen_at: None,
             seen_count: 0,

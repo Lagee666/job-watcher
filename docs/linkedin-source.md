@@ -4,7 +4,8 @@
 
 LinkedIn discovery uses Gmail Job Alert messages through Google's Gmail API.
 The source does not use LinkedIn login, cookies, Chromium, Playwright,
-Selenium, or authenticated LinkedIn endpoints.
+Selenium, or authenticated LinkedIn endpoints. Public-page fetching is disabled
+by default; enable it explicitly with `LINKEDIN_FETCH_PUBLIC_DETAILS=true`.
 
 The Gmail search is configurable and defaults to:
 
@@ -48,8 +49,10 @@ https://www.googleapis.com/auth/gmail.readonly
 ## Alert extraction
 
 For each matching Gmail message, the source reads the MIME tree and selects a
-`text/html` part. It extracts public LinkedIn job links and derives identity
-from the numeric segment after `/jobs/view/`:
+`text/html` part and retains its subject. HTML is parsed as a DOM, with no
+browser or JavaScript execution. It extracts anchors on real `linkedin.com`
+hosts, including regional hosts, `/comm/jobs/view/`, and slugged URLs ending in
+a numeric job ID. Tracking parameters never participate in identity:
 
 ```text
 https://www.linkedin.com/jobs/view/4454432978/?refId=x&trackingId=y
@@ -59,6 +62,45 @@ https://www.linkedin.com/jobs/view/4454432978/?refId=x&trackingId=y
 
 Tracking parameters never participate in identity. Multiple messages, alerts,
 or tracking URLs for the same ID become one job in a synchronization.
+
+Each link is associated with a surrounding card containing only that LinkedIn
+job ID, so company/location/career links are not copied from neighboring jobs.
+Metadata comes from explicit company/location attributes, company links, and
+supported adjacent text layouts such as `Company · Location`. Generic buttons
+do not replace meaningful titles. Duplicate alerts fill missing metadata
+instead of keeping the first incomplete record forever. A subject fallback is
+used only for a single job or an exactly matching primary title, never all
+recommendations. Absent information remains unknown. These are layout
+heuristics, not a guarantee that every LinkedIn email template is supported.
+
+## Company JD enrichment
+
+The default flow uses email metadata first. A single company-job link directly
+associated with that email card may enrich its description:
+
+- Greenhouse job links use the public Job Board detail API; see
+  [greenhouse-source.md](greenhouse-source.md).
+- Lever job links use the public Postings detail API; see
+  [lever-source.md](lever-source.md).
+- Other HTTPS career hosts must be explicitly listed in
+  `JOB_WATCHER_CAREER_HOSTS`. Their page must contain exactly one matching
+  `JobPosting` JSON-LD record, including title and employer. No generic body
+  text or JavaScript/browser fallback is used.
+
+Titles must match after case/whitespace normalization (C++, levels, and other
+meaningful punctuation are preserved). Company names are checked when the
+provider supplies them, and supplied locations must agree. API job IDs must
+match the email's company link. Ambiguous links or mismatched records are not
+accepted. There is no automatic company-site search or fuzzy title matching.
+Google, Microsoft, or other postings with only a LinkedIn link stay metadata
+only unless a supported, directly associated company link is available.
+
+Requests are sequential, separated by one second, capped at 20 per run, bounded
+to 20 seconds/2 MiB per response, and never follow redirects. Only fixed ATS
+API hosts or explicitly configured company hosts are fetched. Company failures
+preserve email data and report `fetch_error`; successful JDs include their
+company job URL in `description_url`. LinkedIn identity and original URL remain
+unchanged. Previously complete JDs are reused without network access.
 
 Processed Gmail message IDs are stored in
 `LINKEDIN_PROCESSED_MESSAGES_FILE`. The source does not rely on read/unread
@@ -72,7 +114,8 @@ SQLite, change history, or the processed-message state.
 
 ## Public LinkedIn page mapping
 
-New LinkedIn jobs are fetched from their normalized public URL with conservative
+When `LINKEDIN_FETCH_PUBLIC_DETAILS=true`, incomplete LinkedIn jobs may be
+fetched from their normalized public URL with conservative
 sequential HTTP requests, waiting ten seconds between links. A job ID already
 stored in SQLite with a non-empty description reuses its stored normalized
 record and is not fetched again; its seen-tracking values are updated by the

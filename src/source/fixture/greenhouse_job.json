@@ -1,0 +1,8 @@
+{
+  "id": 1234,
+  "title": "Rust & Linux Engineer",
+  "company_name": "Acme Systems",
+  "location": {"name": "Taipei, Taiwan"},
+  "first_published": "2026-11-20T00:00:00Z",
+  "content": "&lt;p&gt;Build Rust &amp; Linux connectivity services.&lt;/p&gt;&lt;h2&gt;Qualifications&lt;/h2&gt;&lt;ul&gt;&lt;li&gt;Production async networking and Linux experience.&lt;/li&gt;&lt;/ul&gt;"
+}

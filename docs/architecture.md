@@ -29,7 +29,8 @@ contact 104.
 ## Synchronization pipeline
 
 1. Acquire every enabled source: 104 uses Chromium/CDP; LinkedIn searches Gmail
-   Job Alert messages and fetches public job pages over HTTP.
+   Job Alert messages, extracts card metadata, and optionally enriches directly
+   associated company-career links. Direct LinkedIn HTTP fetching is opt-in.
 2. Reject incomplete or untrusted source snapshots so one provider failure
    cannot cause mass deletions. LinkedIn deletion comparison is source-scoped.
 3. Normalize both sources into the same Job model and deduplicate LinkedIn
@@ -95,3 +96,19 @@ HTTP/access-wall restriction should stop the current batch. That platform
 decision stays in the source module. Remaining identities remain available as
 metadata, and cached complete jobs remain reusable. This is not a durable retry
 queue or a cross-run cooldown.
+
+`source/linkedin/alerts.rs` owns DOM-based email extraction, URL validation,
+subject fallback, and metadata merging. `source/linkedin/careers.rs` owns
+company JD enrichment. These are enrichment components of the LinkedIn alert
+source, not independent inventory sources: the original `(source, external_id)`
+and LinkedIn URL remain unchanged. Successful enrichment records the company
+job URL in `description_url`, which survives SQLite persistence and JSON/history
+export. Failed or ambiguous enrichment never invents a complete JD.
+
+Gmail retains each decoded HTML message's subject so fallback can enrich only
+the single job or a matching primary title. DOM parsing uses `scraper`: existing
+string-offset parsing could not reliably associate nested email tables, HTML
+entities, or multiple job cards. This dependency avoids requiring Chromium for
+email parsing. Complete cached JDs and richer prior metadata remain reusable.
+The new nullable provenance column is migrated in place; legacy JSON remains
+readable, and a failed update cannot erase the source of a preserved JD.

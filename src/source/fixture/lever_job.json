@@ -1,0 +1,8 @@
+{
+  "id": "abc-123",
+  "text": "Senior C++ Engineer",
+  "categories": {"location": "Hsinchu, Taiwan"},
+  "descriptionPlain": "Build C++ network services, including Vec<T> adapters, on embedded Linux devices.",
+  "lists": [{"text": "Qualifications", "content": "<ul><li>SocketCAN and network debugging experience.</li></ul>"}],
+  "additionalPlain": "We welcome systems engineering experience."
+}

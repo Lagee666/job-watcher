@@ -60,7 +60,9 @@ enables the LINE bot and scheduler.
 
 104 remains a rendered Chromium/CDP source. LinkedIn is optional and uses the
 Gmail API to read Job Alert messages, then fetches public LinkedIn pages without
-login cookies or browser sessions. See
+login cookies or browser sessions only when explicitly enabled. By default,
+LinkedIn discovery uses email metadata and supported company-career links from
+the same email card; it makes no direct LinkedIn page requests. See
 [docs/linkedin-source.md](docs/linkedin-source.md) for OAuth setup, alert
 parsing, public-page mapping, and failure safety. Set `LINKEDIN_ENABLED=true`,
 provide `GMAIL_OAUTH_CLIENT_FILE` and `GMAIL_OAUTH_TOKEN_FILE`, and configure
@@ -72,6 +74,27 @@ description are reused without another public-page HTTP request. Their
 jobs in the combined change history, Gmail summary, and `job-list.json`.
 Stored IDs without a description are fetched again so their JD can be completed.
 Only newly discovered or incomplete LinkedIn IDs need detail-page fetching.
+Email extraction reads each job card independently, including regional and
+`/comm/jobs/view/` links. It extracts title, company, location, and directly
+associated company job links, and merges richer metadata across duplicate
+alerts. Missing fields remain unknown rather than borrowing another card's data.
+Supported Greenhouse and Lever links can provide full JDs through their public
+posting APIs. Other career pages require an exact host in
+`JOB_WATCHER_CAREER_HOSTS` and matching `JobPosting` JSON-LD. No company site is
+guessed or searched automatically. A missing link or an unverified match remains
+`MetadataOnly`; a company enrichment error is retained in `fetch_error`.
+
+```dotenv
+# Default: email discovery plus verified company-career enrichment.
+LINKEDIN_FETCH_PUBLIC_DETAILS=false
+# Optional comma-separated exact company-career hosts for JSON-LD retrieval.
+JOB_WATCHER_CAREER_HOSTS=
+```
+
+This changes the previous direct-page behavior: public LinkedIn fetching is
+now opt-in through `LINKEDIN_FETCH_PUBLIC_DETAILS=true`. Existing complete JDs
+remain cached. Company enrichment makes at most 20 requests per synchronization,
+one at a time with a one-second delay, and does not follow redirects.
 If LinkedIn returns HTTP 401/403/429/999 or redirects to a login/access wall,
 remaining detail requests stop for that synchronization. Unattempted jobs retain
 their alert metadata with `MetadataOnly` and a deferred-request explanation;
@@ -90,13 +113,14 @@ fields have not changed. Incremental mode uses recent-first listing fields as a
 pre-filter; `update-jobs-all` is available when every JD must be checked. See
 [docs/104-source.md](docs/104-source.md).
 
-Both sources expose `fetch_state` and an optional `fetch_error` in SQLite,
+Both sources expose `fetch_state`, optional `fetch_error`, and optional
+`description_url` (the source of the JD text) in SQLite,
 `job-list.json`, and daily change records. A failed 104 refresh keeps the old JD
 but reports `FetchFailed`; a successful refresh clears the error. LinkedIn
 errors include HTTP status and final URL when available, or the request error
 chain. A successful HTTP response without a supported description reports
 `ParseFailed`; redirects to login/access-wall URLs report `FetchFailed`.
-Existing databases receive the nullable `fetch_error` column automatically.
+Existing databases receive the nullable diagnostic/provenance columns automatically.
 This improves diagnosis; it does not make an access-restricted website available.
 
 To capture one update's diagnostic log on the Pi:

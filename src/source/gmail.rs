@@ -19,6 +19,12 @@ pub struct GmailClient {
     token_file: PathBuf,
 }
 
+pub struct HtmlMessage {
+    pub id: String,
+    pub subject: String,
+    pub html: String,
+}
+
 #[derive(Debug, Deserialize)]
 struct MessageList {
     #[serde(default)]
@@ -85,7 +91,7 @@ impl GmailClient {
         })
     }
 
-    pub fn search_html_messages(&mut self, query: &str) -> Result<Vec<(String, String)>> {
+    pub fn search_html_messages(&mut self, query: &str) -> Result<Vec<HtmlMessage>> {
         let access_token = self.access_token()?;
         let list: MessageList = self
             .http
@@ -130,7 +136,11 @@ impl GmailClient {
                     subject,
                     "checking Gmail message"
                 );
-                messages.push((full.id, html));
+                messages.push(HtmlMessage {
+                    id: full.id,
+                    subject: subject.to_owned(),
+                    html,
+                });
             }
         }
         debug!(

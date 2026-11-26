@@ -7,12 +7,19 @@ use serde_json::Value;
 use std::{collections::HashSet, env, fs, thread, time::Duration};
 use tracing::{debug, info};
 
+mod alerts;
+mod careers;
+#[cfg(test)]
+use alerts::extract_alert_jobs;
+use alerts::{canonical_linkedin_url, extract_alert_jobs_with_subject, merge_alert_jobs};
+
 const SOURCE: &str = "linkedin";
 const DEFAULT_QUERY: &str = "from:(linkedin.com) newer_than:30d";
 
 #[derive(Clone, Debug)]
 pub struct LinkedInAlertSource {
     gmail_query: String,
+    fetch_public_details: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -22,6 +29,7 @@ struct AlertJob {
     title: String,
     company: String,
     location: Option<String>,
+    career_url: Option<String>,
 }
 
 struct DetailFetch {
@@ -58,6 +66,14 @@ impl LinkedInAlertSource {
         }
         Ok(Some(Self {
             gmail_query: env::var("LINKEDIN_GMAIL_QUERY").unwrap_or_else(|_| DEFAULT_QUERY.into()),
+            fetch_public_details: env::var("LINKEDIN_FETCH_PUBLIC_DETAILS").ok().is_some_and(
+                |value| {
+                    matches!(
+                        value.to_ascii_lowercase().as_str(),
+                        "1" | "true" | "yes" | "on"
+                    )
+                },
+            ),
         }))
     }
 
@@ -71,11 +87,12 @@ impl LinkedInAlertSource {
             .unwrap_or_default();
         let mut jobs = Vec::new();
         let mut message_ids = Vec::new();
-        for (message_id, html) in messages {
+        for message in messages {
+            let message_id = message.id;
             if skip_processed && processed.contains(&message_id) {
                 continue;
             }
-            let alert_jobs = extract_alert_jobs(&html);
+            let alert_jobs = extract_alert_jobs_with_subject(&message.html, &message.subject);
             debug!(
                 message_id = %message_id,
                 job_count = alert_jobs.len(),
@@ -92,9 +109,7 @@ impl LinkedInAlertSource {
             jobs.extend(alert_jobs);
             message_ids.push(message_id);
         }
-        let mut ids = HashSet::new();
-        jobs.retain(|job| ids.insert(job.id.clone()));
-        Ok((jobs, message_ids))
+        Ok((merge_alert_jobs(jobs), message_ids))
     }
 
     pub fn search_alerts(&self) -> Result<Vec<JobListing>> {
@@ -110,15 +125,52 @@ impl LinkedInAlertSource {
         // rather than Gmail message state, determines whether detail fetching
         // is needed and lets known jobs update their seen counters.
         let (alerts, processed_message_ids) = self.discover(false)?;
+        let mut prepared = known.clone();
+        let mut career_errors = std::collections::HashMap::new();
+        let careers = careers::CareerFetcher::from_env()?;
+        let mut career_requests = 0;
+        for alert in &alerts {
+            if prepared
+                .get(&alert.id)
+                .is_some_and(has_complete_description)
+                || !careers.supports(alert)
+            {
+                continue;
+            }
+            if career_requests >= 20 {
+                career_errors.insert(
+                    alert.id.clone(),
+                    "company JD request deferred: per-run limit of 20 reached".to_owned(),
+                );
+                continue;
+            }
+            if career_requests > 0 {
+                thread::sleep(Duration::from_secs(1));
+            }
+            career_requests += 1;
+            match careers.enrich(alert) {
+                Ok(Some(job)) => {
+                    prepared.insert(alert.id.clone(), job);
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    tracing::warn!(job_id = %alert.id, error = %format!("{error:#}"), "company JD enrichment failed; preserving email metadata");
+                    career_errors.insert(
+                        alert.id.clone(),
+                        format!("company JD enrichment failed: {error:#}"),
+                    );
+                }
+            }
+        }
         let fetch_alerts = alerts
             .iter()
             .filter(|alert| {
-                known
+                prepared
                     .get(&alert.id)
                     .is_none_or(|job| !has_complete_description(job))
             })
             .count();
-        let client = if fetch_alerts > 0 {
+        let client = if self.fetch_public_details && fetch_alerts > 0 {
             Some(
                 Client::builder()
                     .timeout(Duration::from_secs(30))
@@ -129,17 +181,22 @@ impl LinkedInAlertSource {
         } else {
             None
         };
-        let jobs = acquire_alert_jobs(
+        let mut jobs = acquire_details(
             alerts,
-            known,
-            |alert| {
-                let client = client
-                    .as_ref()
-                    .context("missing LinkedIn public-page client")?;
-                Ok(fetch_job(client, alert))
-            },
-            thread::sleep,
+            &prepared,
+            self.fetch_public_details,
+            client.as_ref(),
         )?;
+        for job in &mut jobs {
+            if !has_complete_description(job)
+                && let Some(error) = career_errors.remove(&job.external_id)
+            {
+                job.fetch_error = Some(match job.fetch_error.take() {
+                    Some(previous) => format!("{previous}; {error}"),
+                    None => error,
+                });
+            }
+        }
         if jobs.iter().all(|job| job.fetch_state == "Complete") {
             record_processed_messages(&processed_message_file(), &processed_message_ids)?;
         }
@@ -152,6 +209,35 @@ impl LinkedInAlertSource {
     }
 }
 
+fn acquire_details(
+    alerts: Vec<AlertJob>,
+    known: &std::collections::HashMap<String, JobListing>,
+    public_details: bool,
+    client: Option<&Client>,
+) -> Result<Vec<JobListing>> {
+    acquire_alert_jobs(
+        alerts,
+        known,
+        |alert| {
+            if !public_details {
+                return Ok(DetailFetch {
+                    job: alert_metadata(alert),
+                    stop_detail_requests: false,
+                });
+            }
+            Ok(fetch_job(
+                client.context("missing LinkedIn public-page client")?,
+                alert,
+            ))
+        },
+        |duration| {
+            if public_details {
+                thread::sleep(duration);
+            }
+        },
+    )
+}
+
 fn acquire_alert_jobs(
     alerts: Vec<AlertJob>,
     known: &std::collections::HashMap<String, JobListing>,
@@ -161,7 +247,20 @@ fn acquire_alert_jobs(
     let mut jobs = Vec::with_capacity(alerts.len());
     let mut fetched = 0;
     let mut deferred_reason = None;
-    for alert in alerts {
+    for mut alert in alerts {
+        if let Some(existing) = known.get(&alert.id) {
+            if alerts::is_placeholder_title(&alert.title)
+                && !alerts::is_placeholder_title(&existing.title)
+            {
+                alert.title = existing.title.clone();
+            }
+            if alert.company == "Unknown company" && existing.company != "Unknown company" {
+                alert.company = existing.company.clone();
+            }
+            if alert.location.is_none() {
+                alert.location = existing.location.clone();
+            }
+        }
         if let Some(existing) = known.get(&alert.id)
             && has_complete_description(existing)
         {
@@ -170,7 +269,19 @@ fn acquire_alert_jobs(
                 url = %alert.url,
                 "LinkedIn job already exists in SQLite; updating seen tracking without HTTP fetch"
             );
-            jobs.push(existing.clone());
+            let mut job = existing.clone();
+            if alerts::is_placeholder_title(&job.title)
+                && !alerts::is_placeholder_title(&alert.title)
+            {
+                job.title = alert.title;
+            }
+            if job.company == "Unknown company" && alert.company != "Unknown company" {
+                job.company = alert.company;
+            }
+            if job.location.is_none() {
+                job.location = alert.location;
+            }
+            jobs.push(job);
             continue;
         }
         if let Some(reason) = deferred_reason.as_deref() {
@@ -355,6 +466,7 @@ fn alert_metadata(alert: AlertJob) -> JobListing {
         platform_updated_at: None,
         fetch_state: "MetadataOnly".into(),
         fetch_error: None,
+        description_url: None,
         first_seen_at: None,
         last_seen_at: None,
         seen_count: 0,
@@ -480,6 +592,9 @@ fn enrich_from_html_at(alert: AlertJob, html: &str, scraped_at: DateTime<Utc>) -
     } else {
         "ParseFailed"
     };
+    let description_url = description
+        .as_ref()
+        .map(|_| header.url.as_ref().unwrap_or(&alert.url).clone());
     JobListing {
         source: SOURCE.into(),
         external_id,
@@ -493,6 +608,7 @@ fn enrich_from_html_at(alert: AlertJob, html: &str, scraped_at: DateTime<Utc>) -
         platform_updated_at: None,
         fetch_state: state.into(),
         fetch_error: None,
+        description_url,
         first_seen_at: None,
         last_seen_at: None,
         seen_count: 0,
@@ -514,65 +630,11 @@ fn metadata_only(alert: AlertJob, state: &str, detail: &str) -> JobListing {
         platform_updated_at: None,
         fetch_state: state.into(),
         fetch_error: Some(detail.to_owned()),
+        description_url: None,
         first_seen_at: None,
         last_seen_at: None,
         seen_count: 0,
     }
-}
-
-fn extract_alert_jobs(html: &str) -> Vec<AlertJob> {
-    let mut jobs = Vec::new();
-    let mut search_from = 0;
-    while let Some(relative) = html[search_from..].find("https://www.linkedin.com/") {
-        let start = search_from + relative;
-        let end = html[start..]
-            .find(|character: char| {
-                character.is_whitespace() || matches!(character, '"' | '\'' | '<' | '>')
-            })
-            .map_or(html.len(), |offset| start + offset);
-        let raw_url = html[start..end].replace("&amp;", "&");
-        if let Some((id, url)) = canonical_linkedin_url(&raw_url) {
-            let title =
-                alert_anchor_text(html, start).unwrap_or_else(|| "LinkedIn job alert".into());
-            jobs.push(AlertJob {
-                id,
-                url,
-                title,
-                company: "Unknown company".into(),
-                location: None,
-            });
-        }
-        search_from = end.max(start + 1);
-    }
-    let mut ids = HashSet::new();
-    jobs.into_iter()
-        .filter(|job| ids.insert(job.id.clone()))
-        .collect()
-}
-
-fn alert_anchor_text(html: &str, url_start: usize) -> Option<String> {
-    let anchor_start = html[..url_start]
-        .rfind("<a ")
-        .or_else(|| html[..url_start].rfind("<a>"))?;
-    let content_start = html[anchor_start..].find('>')? + anchor_start + 1;
-    let content_end = html[content_start..].find("</a>")? + content_start;
-    let text = strip_html(&html[content_start..content_end]);
-    (!text.is_empty()).then_some(text)
-}
-
-fn canonical_linkedin_url(value: &str) -> Option<(String, String)> {
-    let marker = "/jobs/view/";
-    let start = value.find(marker)? + marker.len();
-    let id: String = value[start..]
-        .chars()
-        .take_while(char::is_ascii_digit)
-        .collect();
-    (!id.is_empty()).then(|| {
-        (
-            id.clone(),
-            format!("https://www.linkedin.com/jobs/view/{id}/"),
-        )
-    })
 }
 
 fn extract_json_ld(html: &str) -> Option<Value> {
@@ -1098,9 +1160,9 @@ fn strip_ui_suffix(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        AlertJob, DetailFetch, acquire_alert_jobs, alert_metadata, canonical_linkedin_url,
-        enrich_from_html, enrich_from_html_at, extract_alert_jobs, fetch_job, metadata_only,
-        parse_linkedin_header,
+        AlertJob, DetailFetch, acquire_alert_jobs, acquire_details, alert_metadata,
+        canonical_linkedin_url, enrich_from_html, enrich_from_html_at, extract_alert_jobs,
+        fetch_job, metadata_only, parse_linkedin_header,
     };
     use crate::watcher::JobListing;
     use reqwest::blocking::Client;
@@ -1145,6 +1207,7 @@ mod tests {
                 title: "Alert title".into(),
                 company: "Alert company".into(),
                 location: None,
+                career_url: None,
             },
         );
         server.join().unwrap();
@@ -1260,7 +1323,67 @@ mod tests {
             title: format!("Role {id}"),
             company: "Company".into(),
             location: None,
+            career_url: None,
         }
+    }
+
+    #[test]
+    fn email_only_mode_needs_no_http_client_and_keeps_prior_metadata() {
+        let mut old = alert_metadata(test_alert("known"));
+        old.title = "Rust Systems Engineer".into();
+        old.company = "Acme".into();
+        old.location = Some("Taipei, Taiwan".into());
+        old.fetch_state = "FetchFailed".into();
+        old.fetch_error = Some("HTTP 429".into());
+        let mut alert = test_alert("known");
+        alert.title = "LinkedIn job alert".into();
+        alert.company = "Unknown company".into();
+        let known = std::collections::HashMap::from([("known".into(), old)]);
+        let jobs = acquire_details(vec![alert, test_alert("new")], &known, false, None).unwrap();
+        assert_eq!(jobs.len(), 2);
+        assert_eq!(jobs[0].title, "Rust Systems Engineer");
+        assert_eq!(jobs[0].company, "Acme");
+        assert_eq!(jobs[0].location.as_deref(), Some("Taipei, Taiwan"));
+        assert!(
+            jobs.iter()
+                .all(|job| job.fetch_state == "MetadataOnly" && job.fetch_error.is_none())
+        );
+    }
+
+    #[test]
+    fn email_to_company_jd_pipeline_keeps_other_jobs_as_metadata_without_linkedin_http() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let alerts = super::alerts::extract_alert_jobs_with_subject(
+            include_str!("fixture/linkedin_alert_email.html"),
+            "Rust & Linux Engineer at Acme Systems",
+        );
+        let careers = super::careers::CareerFetcher::from_env().unwrap();
+        let complete = careers
+            .enrich_with(&alerts[0], |_| {
+                Ok(include_str!("fixture/greenhouse_job.json").into())
+            })
+            .unwrap()
+            .unwrap();
+        let known = std::collections::HashMap::from([(complete.external_id.clone(), complete)]);
+        let jobs = acquire_details(alerts, &known, false, None).unwrap();
+        assert_eq!(jobs.len(), 3);
+        assert_eq!(jobs[0].source, "linkedin");
+        assert_eq!(jobs[0].fetch_state, "Complete");
+        assert!(
+            jobs[0]
+                .description
+                .as_deref()
+                .unwrap()
+                .contains("Qualifications")
+        );
+        assert_eq!(
+            jobs[0].description_url.as_deref(),
+            Some("https://boards.greenhouse.io/acme/jobs/1234")
+        );
+        assert_eq!(jobs[1].fetch_state, "MetadataOnly");
+        assert_eq!(jobs[1].company, "Beta Devices");
+        assert!(jobs[1].description.is_none());
+        assert_eq!(jobs[2].company, "Unknown company");
     }
 
     #[test]
@@ -1346,6 +1469,7 @@ mod tests {
                 title: "Alert title".into(),
                 company: "Alert company".into(),
                 location: None,
+                career_url: None,
             },
             &html,
         );
@@ -1374,6 +1498,7 @@ mod tests {
                 title: "Alert title".into(),
                 company: "Alert company".into(),
                 location: Some("Taipei".into()),
+                career_url: None,
             },
             r#"<h1>Page title</h1><span data-testid="job-details-company-name">DOM Company</span><time datetime="2026-08-21"></time><span data-testid="expandable-text-box"><strong>Responsibilities</strong> Build reliable backend systems for production services and maintain Linux infrastructure.<button data-testid="expandable-text-button">... more</button></span>"#,
         );
@@ -1394,6 +1519,7 @@ mod tests {
                 title: "Alert title".into(),
                 company: "Alert company".into(),
                 location: None,
+                career_url: None,
             },
             r#"Reposted 3 days ago <span data-testid="expandable-text-box">A complete job description with enough meaningful content to pass extraction.</span>"#,
             chrono::DateTime::parse_from_rfc3339("2026-08-23T00:00:00Z")
@@ -1432,6 +1558,7 @@ mod tests {
                 title: "Alert title".into(),
                 company: "Unknown company".into(),
                 location: None,
+                career_url: None,
             },
         );
         assert_eq!(header.job_id.as_deref(), Some("4447522099"));
@@ -1466,6 +1593,7 @@ mod tests {
                 title: "LinkedIn job alert".into(),
                 company: "Unknown company".into(),
                 location: None,
+                career_url: None,
             },
             &html,
             chrono::DateTime::parse_from_rfc3339("2026-08-20T00:00:00Z")
@@ -1511,6 +1639,7 @@ mod tests {
                 title: "LinkedIn job alert".into(),
                 company: "Unknown company".into(),
                 location: None,
+                career_url: None,
             },
             &html,
             chrono::DateTime::parse_from_rfc3339("2026-08-20T00:00:00Z")
